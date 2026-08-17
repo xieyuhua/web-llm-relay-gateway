@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>手动对话</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="popup">
+  <h2>网页大模型聚合网关</h2>
+  <p class="hint">所有选择器 / 接口 / 字段映射均在「网关插件配置」（扩展设置页）中按标签页统一设置，这里只做手动对话。</p>
+
+  <div class="pick-bar">
+    <label class="pick-toggle" title="开启后，在下方「目标标签页」对应的网页点击任意元素，控制台会打印其 CSS 选择器与 XPath">
+      <input type="checkbox" id="pickMode" />
+      <span class="pick-track"></span>
+      <span class="pick-label">🔍 元素探测</span>
+    </label>
+    <span class="pick-tip" id="pickTip">关闭</span>
+  </div>
+
+  <label>目标标签页（默认自动匹配当前活动页，可手动切换）
+    <select id="targetTabId"><option value="">— 请先在扩展设置中启用并配置标签页 —</option></select>
+  </label>
+  <div class="row">
+    <button type="button" id="refreshTabs">刷新</button>
+    <a id="openOptions" href="#" style="font-size:12px;align-self:center;">打开网关插件配置</a>
+  </div>
+
+  <h3>手动对话</h3>
+  <label>内容
+    <textarea id="prompt" rows="5" placeholder="输入要发送给网页大模型的内容"></textarea>
+  </label>
+  <div class="row">
+    <button id="send">发送</button>
+    <button id="clear">清空</button>
+  </div>
+  <h4>输出（流式）</h4>
+  <pre id="output"></pre>
+  <script src="popup.js"></script>
+</body>
+</html>

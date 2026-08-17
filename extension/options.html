@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>网关插件配置 · Relay Console</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="options">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⬡</span>
+      <div>
+        <h1>Relay Console</h1>
+        <p class="sub">多标签页大模型监听 · 独立网关连接</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <label class="theme-select" title="主题">
+        <span class="theme-ico">◐</span>
+        <select id="themeSelect">
+          <option value="dark">暗色 · 深空</option>
+          <option value="light">亮色 · 科技</option>
+          <option value="cyber">赛博 · 霓虹</option>
+        </select>
+      </label>
+      <label class="theme-select" title="调试：在控制台打印匹配与传输数据">
+        <input type="checkbox" id="debugToggle" />
+        <span>调试日志</span>
+      </label>
+      <button type="button" id="addTabTop" class="btn-primary">＋ 添加标签页</button>
+      <button type="button" id="saveAll" class="btn-accent">保存全部</button>
+      <button type="button" id="exportBtn" class="btn-accent">导出 JSON</button>
+      <button type="button" id="importBtn" class="btn-accent">导入 JSON</button>
+      <input type="file" id="importFile" accept="application/json,.json" style="display:none" />
+      <span id="status"></span>
+    </div>
+  </header>
+
+  <main class="console">
+    <section class="cards" id="tabCards"><!-- JS 渲染：每个标签页一张卡片 --></section>
+    <p class="empty" id="tabEmpty">尚未添加任何标签页。点击右上角「＋ 添加标签页」从当前打开的浏览器标签里挑选。</p>
+  </main>
+
+  <!-- 添加标签页：从当前打开的浏览器标签里挑选 -->
+  <div class="modal-mask" id="tabPickerMask" style="display:none">
+    <div class="modal">
+      <div class="modal-head"><h3>选择要监听的标签页</h3><span class="modal-close" id="tabPickerCancel">×</span></div>
+      <div id="tabPickerList" class="picker-list"></div>
+    </div>
+  </div>
+
+  <!-- 移除确认 -->
+  <div class="modal-mask" id="confirmMask" style="display:none">
+    <div class="modal confirm">
+      <div class="modal-head"><h3>移除确认</h3></div>
+      <p id="confirmText" class="confirm-text"></p>
+      <div class="confirm-actions">
+        <button type="button" id="confirmCancel" class="btn-accent">取消</button>
+        <button type="button" id="confirmOk" class="btn-danger">确认移除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 编辑标签页（独立弹窗） -->
+  <div class="modal-mask" id="editModal" style="display:none">
+    <div class="modal edit-modal">
+      <div class="modal-head">
+        <h3>编辑：<span id="editTitle"></span></h3>
+        <span class="modal-close" id="editClose">×</span>
+      </div>
+      <div id="editBody" class="edit-body"></div>
+      <div class="confirm-actions">
+        <button type="button" id="editCancel" class="btn-accent">取消</button>
+        <button type="button" id="editSave" class="btn-primary">保存此标签</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# 编译产物
+relay.exe
+simws.exe
+
+# 日志与临时测试文件
+*.log
+body.json
+cancel_body.json
+last_task.txt
+stream_out.txt
+
+# 本地配置覆盖（按需保留）
+# config.local.yaml

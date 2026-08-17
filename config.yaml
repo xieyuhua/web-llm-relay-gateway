@@ -1,0 +1,24 @@
+# 网页大模型聚合网关配置
+
+http_addr: ":8191"        # 监听地址，环境变量 HTTP_ADDR 可覆盖
+ws_path: "/ws"            # WebSocket 升级路径
+api_prefix: "/v1"         # OpenAI API 前缀
+auth_token: "sk-demo-token"  # Bearer Token，环境变量 AUTH_TOKEN 可覆盖
+
+# 模型路由表：对外 model 名 -> 插件实例 tag
+models:
+  - id: "chatgpt-web"
+    owned_by: "chatgpt"
+    tag: "chatgpt"
+  - id: "claude-web"
+    owned_by: "claude"
+    tag: "claude"
+  - id: "auto"
+    owned_by: "relay"
+    tag: "auto"
+
+# 速率限制（全局，按 Token 维度在后续版本细化）
+rate_limit:
+  enabled: false
+  qps: 10
+  max_tasks: 50

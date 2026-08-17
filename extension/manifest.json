@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "网页大模型聚合网关插件",
+  "version": "1.0.0",
+  "description": "通过浏览器插件操控网页版大模型（ChatGPT/Claude），并由 Golang 后端经 WebSocket 远程驱动，对外暴露 OpenAI-compatible API。",
+  "permissions": ["storage", "tabs", "scripting", "activeTab", "webNavigation"],
+  "host_permissions": [
+    "<all_urls>",
+    "ws://*/*",
+    "wss://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "网页大模型聚合网关"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["bridge.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["bridge.js", "pageBridge.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

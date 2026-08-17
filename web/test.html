@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网关对接测试台</title>
+<style>
+  /* 默认主题：亮 */
+  :root { --bg:#f5f7fa; --card:#ffffff; --line:#e3e8ef; --txt:#1b1f27; --sub:#6b7280; --ok:#1a9e57; --bad:#d9342b; --acc:#2f6bff; }
+  /* 暗主题 */
+  [data-theme="dark"] { --bg:#0f1115; --card:#181b22; --line:#262b36; --txt:#e6e9ef; --sub:#8b93a7; --ok:#3ddc84; --bad:#ff5c5c; --acc:#4f8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:880px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--sub); margin:0 0 20px; font-size:13px; }
+  .topbar { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+  .theme-btn { flex:0 0 auto; padding:8px 14px; font-size:13px; }
+  @media (max-width:560px){ .topbar { flex-direction:column; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:14px; margin:0 0 12px; color:var(--sub); text-transform:uppercase; letter-spacing:.5px; }
+  label { display:block; color:var(--sub); font-size:12px; margin:8px 0 4px; }
+  input, select, textarea { width:100%; background:var(--bg); border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 11px; font-size:13px; outline:none; }
+  input:focus, select:focus, textarea:focus { border-color:var(--acc); }
+  textarea { resize:vertical; min-height:70px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .row { display:flex; gap:10px; }
+  .row > * { flex:1; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:13px; font-weight:600; cursor:pointer; transition:opacity .15s; }
+  button:hover { opacity:.9; }
+  button.ghost { background:var(--card); color:var(--txt); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .btns { display:flex; gap:10px; margin-top:12px; }
+  .badge { display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .badge .dot { width:8px; height:8px; border-radius:50%; }
+  .ok { background:rgba(61,220,132,.12); color:var(--ok); } .ok .dot{background:var(--ok);}
+  .bad { background:rgba(255,92,92,.12); color:var(--bad); } .bad .dot{background:var(--bad);}
+  .warn { background:rgba(255,193,7,.12); color:#ffc107; } .warn .dot{background:#ffc107;}
+  .kv { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed var(--line); font-size:13px; }
+  .kv:last-child { border:0; }
+  .kv b { color:var(--sub); font-weight:500; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; word-break:break-all; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; max-height:300px; margin:0; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .muted { color:var(--sub); font-size:12px; margin-top:8px; }
+  .pill { display:inline-block; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:2px 8px; margin:3px 4px 0 0; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div>
+      <h1>网关对接测试台</h1>
+      <p class="sub">快速验证当前网关实例是否对接成功：检查在线实例、模型列表，并发送一条对话测试 SSE 流式回传。</p>
+    </div>
+    <button class="ghost theme-btn" id="themeBtn" onclick="toggleTheme()" title="切换主题">🌞 亮</button>
+  </div>
+
+  <div class="card">
+    <h2>连接配置</h2>
+    <div class="row">
+      <div>
+        <label>网关地址</label>
+        <input id="base" value="http://127.0.0.1:8191" />
+      </div>
+      <div>
+        <label>API 前缀</label>
+        <input id="prefix" value="/v1" />
+      </div>
+      <div>
+        <label>Bearer Token</label>
+        <input id="token" value="sk-demo-token" />
+      </div>
+    </div>
+    <div class="btns">
+      <button onclick="runHealth()">① 健康检查（实例在线？）</button>
+      <button class="ghost" onclick="runModels()">② 拉取模型列表</button>
+    </div>
+    <div id="healthOut" class="muted">尚未检测。</div>
+    <div id="modelsOut" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>对话测试（流式 SSE）</h2>
+    <div class="row">
+      <div>
+        <label>模型</label>
+        <select id="model"></select>
+      </div>
+      <div>
+        <label>超时(秒)</label>
+        <input id="timeout" value="120" />
+      </div>
+    </div>
+    <label>系统提示（可选）</label>
+    <textarea id="sys" placeholder="例如：你是一个简洁的助手。"></textarea>
+    <label>用户消息</label>
+    <textarea id="user" placeholder="例如：用一句话介绍你自己。">你好，请简单介绍一下你自己。</textarea>
+    <label><input type="checkbox" id="stream" checked style="width:auto;vertical-align:-2px;margin-right:6px;"/>启用流式（SSE）</label>
+    <div class="btns">
+      <button id="sendBtn" onclick="runChat()">③ 发送对话</button>
+      <button class="ghost" id="cancelBtn" onclick="runCancel()" disabled>④ 取消任务</button>
+    </div>
+    <div id="chatStatus" class="muted">未发送。</div>
+    <pre id="chatOut" style="margin-top:10px;"></pre>
+  </div>
+
+  <div class="card">
+    <h2>说明</h2>
+    <p class="muted" style="margin:0;">
+      • ① 检查后端是否存活及<b>已连接的网页插件实例数</b>（在线实例为 0 时，对话会因无可用执行引擎而返回 503）。<br/>
+      • ② 列出 config.yaml 中配置的对外模型路由。<br/>
+      • ③ 实际向 <span class="mono">/v1/chat/completions</span> 发请求，若插件在线会经网页大模型返回内容；流式模式逐字显示 SSE。<br/>
+      • ④ 在流式进行中可点击取消，会调用 <span class="mono">/v1/chat/cancel</span> 并向插件下发 task.cancel 中断网页请求。<br/>
+      • 网关首页（<span class="mono">/</span>）即本页面。
+    </p>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// 主题：默认亮色，持久化到 localStorage
+function applyTheme(t) {
+  if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+  else document.documentElement.removeAttribute('data-theme');
+  const btn = $('themeBtn');
+  if (btn) btn.innerHTML = (t === 'dark' ? '🌙 暗' : '🌞 亮');
+}
+function initTheme() {
+  let t = localStorage.getItem('theme');
+  if (t !== 'dark' && t !== 'light') t = 'light'; // 默认亮
+  applyTheme(t);
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', next);
+  applyTheme(next);
+}
+initTheme();
+function base() { return $('base').value.replace(/\/+$/, ''); }
+function prefix() { return $('prefix').value || '/v1'; }
+function authHdr() { return { 'Authorization': 'Bearer ' + $('token').value, 'Content-Type': 'application/json' }; }
+
+function setHealth(text, kind) {
+  const el = $('healthOut');
+  const badge = kind === 'ok' ? '<span class="badge ok"><span class="dot"></span>' + text + '</span>'
+    : kind === 'bad' ? '<span class="badge bad"><span class="dot"></span>' + text + '</span>'
+    : '<span class="badge warn"><span class="dot"></span>' + text + '</span>';
+  el.innerHTML = badge;
+}
+
+async function runHealth() {
+  setHealth('检测中…', 'warn');
+  try {
+    const r = await fetch(base() + '/healthz');
+    const j = await r.json();
+    if (r.ok && j.status === 'ok') {
+      const n = j.online_instances || 0;
+      setHealth(`存活 · 在线实例 ${n}`, n > 0 ? 'ok' : 'bad');
+      $('healthOut').innerHTML += ` <span class="muted">（实例为 0 时对话将失败）</span>`;
+    } else {
+      setHealth('异常响应', 'bad');
+    }
+  } catch (e) {
+    // Failed to fetch 多为：服务未启动、地址不可达、跨域被拦（已加 CORS 头，但仍需同源或经本网关域名打开）
+    setHealth('无法连接网关：' + e.message + '（请确认服务已启动、网关地址正确且可访问）', 'bad');
+  }
+}
+
+async function runModels() {
+  $('modelsOut').innerHTML = '<span class="muted">加载中…</span>';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000); // 15s 超时，避免永久“加载中”
+  try {
+    const r = await fetch(base() + prefix() + '/models', { headers: authHdr(), signal: ctrl.signal });
+    clearTimeout(timer);
+    let j = {};
+    try { j = await r.json(); } catch (_) { /* 响应体非 JSON */ }
+    if (!r.ok) {
+      $('modelsOut').innerHTML = '<span class="badge bad"><span class="dot"></span>' + (j.error || ('HTTP ' + r.status)) + '</span>';
+      return;
+    }
+    const list = (j && Array.isArray(j.data)) ? j.data : (Array.isArray(j) ? j : []);
+    const sel = $('model'); sel.innerHTML = '';
+    let pills = '';
+    list.forEach(m => {
+      const id = m.id || m.name || '';
+      const o = document.createElement('option'); o.value = id; o.textContent = id + ' (' + (m.owned_by || '') + ')';
+      sel.appendChild(o);
+      pills += `<span class="pill">${id}</span>`;
+    });
+    if (!list.length) $('modelsOut').innerHTML = '<span class="muted">无可用模型（接口返回为空）</span>';
+    else $('modelsOut').innerHTML = '<span class="badge ok"><span class="dot"></span>成功 ' + list.length + ' 个</span> ' + pills;
+  } catch (e) {
+    clearTimeout(timer);
+    $('modelsOut').innerHTML = '<span class="badge bad"><span class="dot"></span>' + e.message + '</span>';
+  }
+}
+
+let currentTask = null;
+async function runChat() {
+  const out = $('chatOut'); out.textContent = '';
+  const stream = $('stream').checked;
+  const msgs = [];
+  const sys = $('sys').value.trim();
+  if (sys) msgs.push({ role: 'system', content: sys });
+  msgs.push({ role: 'user', content: $('user').value });
+  const body = { model: $('model').value, messages: msgs, stream };
+
+  $('sendBtn').disabled = true;
+  $('cancelBtn').disabled = true;
+  $('chatStatus').textContent = '请求中…';
+
+  try {
+    if (!stream) {
+      const r = await fetch(base() + prefix() + '/chat/completions', { method: 'POST', headers: authHdr(), body: JSON.stringify(body) });
+      const txt = await r.text();
+      out.textContent = txt;
+      if (r.status === 200) currentTask = extractTaskId(txt);
+      $('chatStatus').textContent = r.status === 200 ? '完成 ✓' : ('失败 ' + r.status);
+      $('cancelBtn').disabled = !(r.status === 200 && currentTask);
+    } else {
+      const r = await fetch(base() + prefix() + '/chat/completions', { method: 'POST', headers: authHdr(), body: JSON.stringify(body) });
+      if (!r.ok || !r.body) {
+        const txt = await r.text(); out.textContent = txt;
+        $('chatStatus').textContent = '失败 ' + r.status; $('sendBtn').disabled = false; return;
+      }
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '', gotTask = false;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          const s = line.trim();
+          if (!s || !s.startsWith('data:')) continue;
+          const data = s.slice(5).trim();
+          if (data === '[DONE]') { out.textContent += '\n[DONE]'; continue; }
+          try {
+            const c = JSON.parse(data);
+            if (c.id && !gotTask) { currentTask = c.id.replace('chatcmpl-', ''); gotTask = true; $('cancelBtn').disabled = false; }
+            const d = c.choices && c.choices[0] && c.choices[0].delta;
+            if (d && d.content) out.textContent += d.content;
+            if (c.choices && c.choices[0] && c.choices[0].finish_reason) $('chatStatus').textContent = '完成 ✓ (' + c.choices[0].finish_reason + ')';
+          } catch (e) { out.textContent += '\n[raw] ' + data; }
+        }
+      }
+      $('chatStatus').textContent = $('chatStatus').textContent.startsWith('完成') ? $('chatStatus').textContent : '完成 ✓';
+    }
+  } catch (e) {
+    out.textContent += '\n[error] ' + e.message;
+    $('chatStatus').textContent = '出错：' + e.message;
+  }
+  $('sendBtn').disabled = false;
+}
+
+function extractTaskId(txt) {
+  try { const j = JSON.parse(txt); const id = j.id || ''; return id.replace('chatcmpl-', ''); } catch (e) { return null; }
+}
+
+async function runCancel() {
+  if (!currentTask) { $('chatStatus').textContent = '没有可取消的任务'; return; }
+  try {
+    const r = await fetch(base() + prefix() + '/chat/cancel', { method: 'POST', headers: authHdr(), body: JSON.stringify({ task_id: currentTask }) });
+    const j = await r.json().catch(() => ({}));
+    $('chatStatus').textContent = '已发送取消：' + (j.status || r.status);
+    currentTask = null; $('cancelBtn').disabled = true;
+  } catch (e) {
+    $('chatStatus').textContent = '取消失败：' + e.message;
+  }
+}
+</script>
+</body>
+</html>
