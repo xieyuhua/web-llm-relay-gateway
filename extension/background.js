@@ -153,23 +153,28 @@ function handleEnvelope(env, connTabId) {
         sendTo(connTabId, { type: 'task.error', task_id: env.task_id, data: { code: 'NO_TARGET_TAB', message: '未启用任何标签页监听，请在插件 Options 中勾选并配置标签页' } });
         return;
       }
-      // 路由优先级：
-      //   1) 任务自带 env.tag 且能匹配到某 tab 的 c.tag（多 tab 共用一条 WS 的场景）；
-      //   2) 否则用「这条 WS 连接所服务的 tab」本身（每条 tab 配置建一条独立 WS，
-      //      连接时已绑定该 tab 的 identity，故指令天然属于它自己对应的页面）。
+      // 路由逻辑（与 go 网关的 tag 负载均衡配合）：
+      //   - 每条 tab 配置在背景页建一条独立 WS 连到网关，连接 URL 带该 tab 的 tag；
+      //   - 网关按 tag 做负载均衡：多个 WS 同 tag 时选其中一条下发指令；
+      //   - 因此指令落到哪条 WS（connTabId），网关已经做了选择，背景页应直接路由到
+      //     「这条 WS 连接所服务的 tab」(connections[connTabId].key)，保留网关的均衡意图；
+      //   - env.tag 仅作兜底（连接未找到对应配置时使用），避免再据 tag 在全部 tab 中二次挑选、
+      //     破坏网关所选的那条连接与页面的对应关系。
       const reqTag = (env.tag || '').trim();
       let matched = null;
-      if (reqTag) {
-        matched = tabs.find(({ c }) => (c.tag || '').trim() === reqTag);
+      const connKey = connections[connTabId] && connections[connTabId].key;
+      if (connKey) {
+        matched = tabs.find(({ key }) => key === connKey);
       }
-      if (!matched) {
-        const connKey = connections[connTabId] && connections[connTabId].key;
-        if (connKey) matched = tabs.find(({ key }) => key === connKey);
+      let routeBy = 'conn';
+      if (!matched && reqTag) {
+        matched = tabs.find(({ c }) => (c.tag || '').trim() === reqTag);
+        routeBy = 'tag';
       }
       const target = matched || tabs[0];
       const key = target.key;
       const tabCfg = target.c;
-      console.log('[relay] task.create route -> key=', key, 'tabId=', (() => { try { return resolveLiveTabIdSync(key); } catch { return '?'; } })(), 'byTag=', !!reqTag, 'byConn=', !!(connections[connTabId] && connections[connTabId].key && !reqTag));
+      console.log('[relay] task.create route -> key=', key, 'by=', routeBy, 'reqTag=', reqTag);
       // 解析当前真实 tabId（页面可能关掉重开，tabId 已变）
       resolveLiveTabId(key).then((tabId) => {
         if (tabId == null) {
