@@ -102,7 +102,10 @@ async function connectTab(key, c) {
   ws.onmessage = (ev) => {
     let env;
     try { env = JSON.parse(ev.data); } catch { return; }
-    handleEnvelope(env, id);
+    // 直接把这条 WS 连接自己的 identity(key) 与配置(cfg) 随消息传入；
+    // 同时把该 WS 的 send 封装为 sendBack，确保回传也精确发回这条 WS（而非按 tabId 误发到被覆盖的连接）
+    const sendBack = (e) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(e)); };
+    handleEnvelope(env, id, key, c, sendBack);
   };
   ws.onclose = () => {
     const e = connections[id];
@@ -141,49 +144,60 @@ function sendTo(id, env) {
 const taskTabs = {};
 // task_id -> 网关连接所在 tabId（上行回传用，单标签下等于 taskTabs）
 const taskConns = {};
+// task_id -> 该指令所属 WS 连接的精确回传函数（避免多条 WS 共享同一 tabId 时回传错连）
+const taskSenders = {};
 const finishedTasks = new Set();
 
-function handleEnvelope(env, connTabId) {
+function handleEnvelope(env, connTabId, connKey, connCfg, sendBack) {
   switch (env.type) {
     case 'task.create': {
       console.log('[relay] task.create recv task_id=', env.task_id, 'fromConnTab=', connTabId, 'tag=', env.tag);
-      sendTo(connTabId, { type: 'task.ack', task_id: env.task_id });
+      sendBack({ type: 'task.ack', task_id: env.task_id });
       const tabs = enabledTabConfigs();
       if (tabs.length === 0) {
-        sendTo(connTabId, { type: 'task.error', task_id: env.task_id, data: { code: 'NO_TARGET_TAB', message: '未启用任何标签页监听，请在插件 Options 中勾选并配置标签页' } });
+        sendBack({ type: 'task.error', task_id: env.task_id, data: { code: 'NO_TARGET_TAB', message: '未启用任何标签页监听，请在插件 Options 中勾选并配置标签页' } });
         return;
       }
       // 路由逻辑（与 go 网关的 tag 负载均衡配合）：
-      //   - 每条 tab 配置在背景页建一条独立 WS 连到网关，连接 URL 带该 tab 的 tag；
+      //   - 每条 tab 配置在背景页建一条独立 WS 连到网关，连接 URL 带该 tab 的 tag/instance_id；
       //   - 网关按 tag 做负载均衡：多个 WS 同 tag 时选其中一条下发指令；
-      //   - 因此指令落到哪条 WS（connTabId），网关已经做了选择，背景页应直接路由到
-      //     「这条 WS 连接所服务的 tab」(connections[connTabId].key)，保留网关的均衡意图；
-      //   - env.tag 仅作兜底（连接未找到对应配置时使用），避免再据 tag 在全部 tab 中二次挑选、
-      //     破坏网关所选的那条连接与页面的对应关系。
+      //   - 这条 WS 在 connectTab 时就绑定了它自己的 identity(connKey) 与配置(connCfg)，
+      //     网关选中哪条 WS，指令就直接路由到该 WS 自己的卡片（通过闭包传入，不依赖 tabId 反查）。
+      //   - 这样即使多条 WS 指向同一真实 tab（多个卡片 url 相同），每条 WS 也携带自己的卡片配置，互不覆盖。
       const reqTag = (env.tag || '').trim();
-      let matched = null;
-      const connKey = connections[connTabId] && connections[connTabId].key;
+      let key, tabCfg, routeBy;
       if (connKey) {
-        matched = tabs.find(({ key }) => key === connKey);
-      }
-      let routeBy = 'conn';
-      if (!matched && reqTag) {
-        matched = tabs.find(({ c }) => (c.tag || '').trim() === reqTag);
+        // 优先：用这条 WS 连接自己的配置（网关已选定该 WS，直接对应卡片）
+        key = connKey;
+        tabCfg = connCfg;
+        routeBy = 'conn';
+      } else if (reqTag) {
+        // 兜底（旧兼容）：消息未带连接级配置时，按 tag 在启用卡片中匹配
+        const m = tabs.find(({ c }) => (c.tag || '').trim() === reqTag);
+        key = m ? m.key : (tabs[0] && tabs[0].key);
+        tabCfg = m ? m.c : (tabs[0] && tabs[0].c);
         routeBy = 'tag';
+      } else {
+        key = tabs[0] && tabs[0].key;
+        tabCfg = tabs[0] && tabs[0].c;
+        routeBy = 'fallback';
       }
-      const target = matched || tabs[0];
-      const key = target.key;
-      const tabCfg = target.c;
-      console.log('[relay] task.create route -> key=', key, 'by=', routeBy, 'reqTag=', reqTag);
+      if (!key) {
+        console.error('[relay] task.create 无任何可路由目标，丢弃。connTabId=', connTabId, 'reqTag=', reqTag);
+        return;
+      }
+      console.log('[relay] task.create route -> key=', key, 'by=', routeBy, 'connTabId=', connTabId);
       // 解析当前真实 tabId（页面可能关掉重开，tabId 已变）
       resolveLiveTabId(key).then((tabId) => {
         if (tabId == null) {
-          sendTo(connTabId, { type: 'task.error', task_id: env.task_id, data: { code: 'TARGET_PAGE_CLOSED', message: '目标页面当前未打开（identity=' + key + '），请打开对应网页' } });
+          sendBack({ type: 'task.error', task_id: env.task_id, data: { code: 'TARGET_PAGE_CLOSED', message: '目标页面当前未打开（identity=' + key + '），请打开对应网页' } });
           return;
         }
         // 记录双向映射：task_id -> 目标页面(tabId)、task_id -> 网关连接所在 tab(connTabId)
         taskTabs[env.task_id] = tabId;
         taskConns[env.task_id] = connTabId;
+        // 精确回传函数：确保后续 delta/done 发回这条 WS（而非按 tabId 误发到被覆盖的连接）
+        taskSenders[env.task_id] = sendBack;
 
         // 确保接收端 content script 已就绪（插件安装前打开的页面不会自动注入），content.js 有幂等守卫，可重复注入
         chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content.js'] }).catch(() => {});
@@ -254,7 +268,7 @@ function handleEnvelope(env, connTabId) {
       break;
     }
     case 'ping':
-      sendTo(connTabId, { type: 'pong', data: { ts: Date.now() } });
+      sendBack({ type: 'pong', data: { ts: Date.now() } });
       break;
   }
 }
@@ -266,6 +280,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   for (const tid in taskConns) {
     if (taskConns[tid] === tabId) delete taskConns[tid];
+  }
+  for (const tid in taskSenders) {
+    if (taskConns[tid] === tabId) delete taskSenders[tid];
   }
   if (connections[tabId]) { try { connections[tabId].ws.close(); } catch {} delete connections[tabId]; }
 });
@@ -293,29 +310,36 @@ chrome.runtime.onMessage.addListener((msg) => {
     }
     return;
   }
-  // 上行回传目标：优先取网关连接所在 tab（taskConns），单标签下与 taskTabs 相同
-  const tabId = taskConns[msg.task_id] || taskTabs[msg.task_id] || msg.tabId;
+  // 上行回传目标：精确发回该指令所属的那条 WS（taskSenders），避免多条 WS 共享同一 tabId 时回传错连；
+  // taskConns 作为兜底（任务已结束、senders 已清理时仍能发到对应网关连接）。
+  const sender = taskSenders[msg.task_id];
+  const upstreamId = taskConns[msg.task_id] || taskTabs[msg.task_id] || msg.tabId;
   if (msg.type === 'bridge.delta') {
     if (!msg.task_id) return;
     if (debugOn) console.log('[relay-bg][传输 delta → 网关]', msg.content);
-    sendTo(taskConns[msg.task_id] || taskTabs[msg.task_id], { type: 'task.delta', task_id: msg.task_id, data: { format: 'sse', payload: sseChunk(msg.task_id, msg.content) } });
+    if (sender) sender({ type: 'task.delta', task_id: msg.task_id, data: { format: 'sse', payload: sseChunk(msg.task_id, msg.content) } });
+    else sendTo(upstreamId, { type: 'task.delta', task_id: msg.task_id, data: { format: 'sse', payload: sseChunk(msg.task_id, msg.content) } });
   } else if (msg.type === 'bridge.done') {
     if (!msg.task_id || finishedTasks.has(msg.task_id)) return;
     finishedTasks.add(msg.task_id);
     if (debugOn) console.log('[relay-bg][传输 done → 网关]', msg.task_id);
-    sendTo(taskConns[msg.task_id] || taskTabs[msg.task_id], { type: 'task.done', task_id: msg.task_id, data: { finish_reason: 'stop' } });
+    if (sender) sender({ type: 'task.done', task_id: msg.task_id, data: { finish_reason: 'stop' } });
+    else sendTo(upstreamId, { type: 'task.done', task_id: msg.task_id, data: { finish_reason: 'stop' } });
   } else if (msg.type === 'task.delta') {
     if (debugOn) console.log('[relay-bg][传输 delta → 网关]', msg.content);
-    sendTo(tabId, { type: 'task.delta', task_id: msg.task_id, data: { format: 'sse', payload: sseChunk(msg.task_id, msg.content) } });
+    if (sender) sender({ type: 'task.delta', task_id: msg.task_id, data: { format: 'sse', payload: sseChunk(msg.task_id, msg.content) } });
+    else sendTo(upstreamId, { type: 'task.delta', task_id: msg.task_id, data: { format: 'sse', payload: sseChunk(msg.task_id, msg.content) } });
   } else if (msg.type === 'task.done') {
     if (msg.task_id && finishedTasks.has(msg.task_id)) return;
     if (msg.task_id) finishedTasks.add(msg.task_id);
     if (debugOn) console.log('[relay-bg][传输 done → 网关]', msg.task_id);
-    sendTo(tabId, { type: 'task.done', task_id: msg.task_id, data: { finish_reason: 'stop' } });
+    if (sender) sender({ type: 'task.done', task_id: msg.task_id, data: { finish_reason: 'stop' } });
+    else sendTo(upstreamId, { type: 'task.done', task_id: msg.task_id, data: { finish_reason: 'stop' } });
   } else if (msg.type === 'task.error') {
     if (msg.task_id && finishedTasks.has(msg.task_id)) return;
     if (msg.task_id) finishedTasks.add(msg.task_id);
-    sendTo(tabId, { type: 'task.error', task_id: msg.task_id, data: { code: msg.code, message: msg.message } });
+    if (sender) sender({ type: 'task.error', task_id: msg.task_id, data: { code: msg.code, message: msg.message } });
+    else sendTo(upstreamId, { type: 'task.error', task_id: msg.task_id, data: { code: msg.code, message: msg.message } });
   }
 });
 

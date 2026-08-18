@@ -123,8 +123,8 @@
     let obj = null;
     try { obj = JSON.parse(payload); } catch (e) { obj = null; }
     if (!obj) {
-      // 非 JSON：若规则为 jsonpath 则回退原样，否则原样
-      return /^\[?DONE\]?$/.test(payload) ? '' : payload;
+      // 非 JSON 且未配置提取规则：视为协议噪音（如 status/text/232 等控制行），不回传，避免污染 WS
+      return '';
     }
     // 若配置了 when 条件且不满足，跳过（不回传）
     if (sseRule && sseRule.when && !matchWhen(obj, sseRule.when)) return '';
