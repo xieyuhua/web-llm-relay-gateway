@@ -2,8 +2,9 @@
 // 多标签页监听：每个选项卡 = 一个网页 = 一套完整独立配置（含独立网关连接、选择器、字段映射）。
 // 来自各自网关的任务，定向派发到对应标签页，互不影响。
 //
-// 身份匹配：用「网址 host + 标题」作为稳定 key（storage 主键），运行时再 resolve 到浏览器当前真实的 tabId。
-// 这样关掉网页再重新打开（tabId 会变）也能自动重新激活，不再误判「已关闭」。
+// 身份匹配：用「归一化网址」作为稳定 key（storage 主键），运行时再 resolve 到浏览器当前真实的 tabId。
+// 归一化规则：origin + pathname（去掉 query/hash 等易变参数），这样关掉网页再重新打开（tabId 会变）也能自动重新激活。
+// 同 host 下不同会话（如 /c/aaa、/c/bbb）也能靠 pathname 区分。
 let cfg = null;
 let debugOn = false; // debug 开关：开启后在控制台打印「匹配」「传输」数据
 let instanceId = 'inst-' + Math.random().toString(36).slice(2, 10);
@@ -22,38 +23,43 @@ function loadCfg() {
   });
 }
 
-// ---------- 稳定身份匹配 ----------
-function normTitle(t) { return (t || '').trim().replace(/\s+/g, ' ').slice(0, 40); }
-function keyHost(k) { return (k || '').split('|')[0] || ''; }
-function keyTitle(k) { return (k || '').split('|').slice(1).join('|') || ''; }
-function keyOf(c) {
-  let host = '';
-  try { host = new URL(c.url || '').host; } catch {}
-  return host + '|' + normTitle(c.title);
-}
-// 稳定 key -> 当前真实 tabId（关掉网页再开 tabId 会变，但 host+标题不变，按此重新匹配）
-// 标题可能随对话变化（如 ChatGPT 显示最近一条对话），故在精确匹配失败时做模糊兜底：
-//   同 host 且标题存在包含关系 / 前缀较长公共部分 → 视为同一页面。
-async function resolveLiveTabId(key) {
-  const host = keyHost(key), title = keyTitle(key);
-  const all = await chrome.tabs.query({});
-  let fuzzy = null, fuzzyScore = 0;
-  for (const t of all) {
-    if (!t.url || !/^https?:/.test(t.url)) continue;
-    let h = '';
-    try { h = new URL(t.url).host; } catch {}
-    if (h !== host) continue;
-    const tn = normTitle(t.title);
-    if (tn === title) return t.id; // 精确命中
-    // 模糊：包含关系
-    if (title && tn && (tn.includes(title) || title.includes(tn))) { if (2 > fuzzyScore) { fuzzy = t.id; fuzzyScore = 2; } continue; }
-    // 模糊：前缀公共长度 >= 8
-    let common = 0;
-    const m = Math.min(tn.length, title.length);
-    while (common < m && tn[common] === title[common]) common++;
-    if (common >= 8 && common > fuzzyScore) { fuzzy = t.id; fuzzyScore = common; }
+// ---------- 稳定身份匹配：归一化网址（origin + pathname，去 query/hash） ----------
+function normUrl(u) {
+  try {
+    const p = new URL(u || '');
+    if (!/^https?:$/.test(p.protocol)) return (u || '').trim();
+    // 去掉 query 与 hash，仅保留 origin + pathname，避免 token/时间戳等易变参数干扰匹配
+    return (p.origin + p.pathname).replace(/\/+$/, '') || p.origin;
+  } catch {
+    return (u || '').trim();
   }
-  return fuzzy; // 模糊命中或 null
+}
+// 兼容旧版：旧配置主键可能是「host|标题」格式，提取其中的 host 做兜底匹配
+function isOldKey(k) { return (k || '').includes('|'); }
+function oldKeyHost(k) { return (k || '').split('|')[0] || ''; }
+// 稳定 key -> 当前真实 tabId
+//   1) 精确：归一化 URL（origin+pathname）完全一致；
+//   2) origin 兜底：key 的 origin 与实际标签 origin 相同即命中（配置通常只填 host 级 URL，
+//      如 https://chatgpt.com，而实际打开了具体对话页 /c/abc，此时按 origin 匹配）。
+//   3) 旧版 host|标题 主键：提取 host 走 origin 兜底。
+async function resolveLiveTabId(key) {
+  const all = await chrome.tabs.query({});
+  const live = all.filter(t => t.url && /^https?:/.test(t.url));
+  // 旧版 host|标题 主键：直接按 host 兜底
+  if (isOldKey(key)) {
+    const host = oldKeyHost(key);
+    const hit = live.find(t => { try { return new URL(t.url).host === host; } catch { return false; } });
+    return hit ? hit.id : null;
+  }
+  const nk = normUrl(key);
+  // 精确：origin+pathname 一致
+  let hit = live.find(t => normUrl(t.url) === nk);
+  if (hit) return hit.id;
+  // origin 兜底：key 只写了 host 级 URL（pathname 为空或 '/'），匹配该 origin 下任意页面
+  let origin = '';
+  try { origin = new URL(key).origin; } catch { return null; }
+  hit = live.find(t => { try { return new URL(t.url).origin === origin; } catch { return false; } });
+  return hit ? hit.id : null;
 }
 
 // 当前启用的标签页配置列表（key 为稳定身份，不再依赖临时 tabId）
@@ -147,19 +153,27 @@ function handleEnvelope(env, connTabId) {
         sendTo(connTabId, { type: 'task.error', task_id: env.task_id, data: { code: 'NO_TARGET_TAB', message: '未启用任何标签页监听，请在插件 Options 中勾选并配置标签页' } });
         return;
       }
-      // 路由：任务自带 tag 优先匹配该 tab 配置的 tag；否则回退第一个启用的 tab
+      // 路由优先级：
+      //   1) 任务自带 env.tag 且能匹配到某 tab 的 c.tag（多 tab 共用一条 WS 的场景）；
+      //   2) 否则用「这条 WS 连接所服务的 tab」本身（每条 tab 配置建一条独立 WS，
+      //      连接时已绑定该 tab 的 identity，故指令天然属于它自己对应的页面）。
       const reqTag = (env.tag || '').trim();
       let matched = null;
       if (reqTag) {
         matched = tabs.find(({ c }) => (c.tag || '').trim() === reqTag);
       }
+      if (!matched) {
+        const connKey = connections[connTabId] && connections[connTabId].key;
+        if (connKey) matched = tabs.find(({ key }) => key === connKey);
+      }
       const target = matched || tabs[0];
       const key = target.key;
       const tabCfg = target.c;
+      console.log('[relay] task.create route -> key=', key, 'tabId=', (() => { try { return resolveLiveTabIdSync(key); } catch { return '?'; } })(), 'byTag=', !!reqTag, 'byConn=', !!(connections[connTabId] && connections[connTabId].key && !reqTag));
       // 解析当前真实 tabId（页面可能关掉重开，tabId 已变）
       resolveLiveTabId(key).then((tabId) => {
         if (tabId == null) {
-          sendTo(connTabId, { type: 'task.error', task_id: env.task_id, data: { code: 'TARGET_PAGE_CLOSED', message: '目标页面当前未打开（host=' + keyHost(key) + '），请打开对应网页' } });
+          sendTo(connTabId, { type: 'task.error', task_id: env.task_id, data: { code: 'TARGET_PAGE_CLOSED', message: '目标页面当前未打开（identity=' + key + '），请打开对应网页' } });
           return;
         }
         // 记录双向映射：task_id -> 目标页面(tabId)、task_id -> 网关连接所在 tab(connTabId)

@@ -1,37 +1,37 @@
 // Popup：轻量手动对话（配置统一在 options 网关插件配置页）
-// 身份匹配：用「网址 host + 标题」作为稳定 key，运行时解析到真实 tabId。
+// 身份匹配：用「归一化网址」作为稳定 key（origin + pathname，去 query/hash），运行时解析到真实 tabId。
 // 关掉网页再重新打开（tabId 会变）也能自动重新匹配，不再误判「已关闭」。
 const $ = (id) => document.getElementById(id);
 
-// ---------- 稳定身份 key ----------
-function normTitle(t) { return (t || '').trim().replace(/\s+/g, ' ').slice(0, 40); }
-function keyOf(tab) {
-  let host = '';
-  try { host = new URL(tab.url || '').host; } catch {}
-  return host + '|' + normTitle(tab.title);
-}
-function keyHost(k) { return (k || '').split('|')[0] || ''; }
-function keyTitle(k) { return (k || '').split('|').slice(1).join('|') || ''; }
-// 稳定 key -> 当前真实 tabId（按 host+标题匹配，关掉重开仍可用）
-// 标题可能随对话变化，故精确匹配失败后做模糊兜底（同 host + 标题包含/长公共前缀）
-async function resolveLiveTabId(key) {
-  const host = keyHost(key), title = keyTitle(key);
-  const all = await chrome.tabs.query({});
-  let fuzzy = null, fuzzyScore = 0;
-  for (const t of all) {
-    if (!t.url || !/^https?:/.test(t.url)) continue;
-    let h = '';
-    try { h = new URL(t.url).host; } catch {}
-    if (h !== host) continue;
-    const tn = normTitle(t.title);
-    if (tn === title) return t.id;
-    if (title && tn && (tn.includes(title) || title.includes(tn))) { if (2 > fuzzyScore) { fuzzy = t.id; fuzzyScore = 2; } continue; }
-    let common = 0;
-    const m = Math.min(tn.length, title.length);
-    while (common < m && tn[common] === title[common]) common++;
-    if (common >= 8 && common > fuzzyScore) { fuzzy = t.id; fuzzyScore = common; }
+// ---------- 稳定身份 key：归一化网址 ----------
+function normUrl(u) {
+  try {
+    const p = new URL(u || '');
+    if (!/^https?:$/.test(p.protocol)) return (u || '').trim();
+    return (p.origin + p.pathname).replace(/\/+$/, '') || p.origin;
+  } catch {
+    return (u || '').trim();
   }
-  return fuzzy;
+}
+function keyOf(tab) { return normUrl(tab.url); }
+function isOldKey(k) { return (k || '').includes('|'); }
+function oldKeyHost(k) { return (k || '').split('|')[0] || ''; }
+// 稳定 key -> 当前真实 tabId（按归一化 URL 匹配；精确失败按 origin 兜底；旧版 host|标题 主键按 host 兜底）
+async function resolveLiveTabId(key) {
+  const all = await chrome.tabs.query({});
+  const live = all.filter(t => t.url && /^https?:/.test(t.url));
+  if (isOldKey(key)) {
+    const host = oldKeyHost(key);
+    const hit = live.find(t => { try { return new URL(t.url).host === host; } catch { return false; } });
+    return hit ? hit.id : null;
+  }
+  const nk = normUrl(key);
+  let hit = live.find(t => normUrl(t.url) === nk);
+  if (hit) return hit.id;
+  let origin = '';
+  try { origin = new URL(key).origin; } catch { return null; }
+  hit = live.find(t => { try { return new URL(t.url).origin === origin; } catch { return false; } });
+  return hit ? hit.id : null;
 }
 
 // 跟随 options 中设置的主题
@@ -63,14 +63,13 @@ async function refreshTabs() {
   let defKey = (s.manualTabId && tabs[s.manualTabId] && tabs[s.manualTabId].enabled && liveMap[s.manualTabId])
     ? s.manualTabId
     : ((activeKey && tabs[activeKey] && tabs[activeKey].enabled) ? activeKey : enabled[0][0]);
-  enabled.sort((a, b) => (b[1].title || '').localeCompare(a[1].title || ''));
+  enabled.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
   for (const [id, c] of enabled) {
     const opt = document.createElement('option');
-    opt.value = id; // 稳定 key
-    const host = (() => { try { return new URL(c.url || '').host; } catch { return ''; } })();
-    const dead = !liveMap[id]; // 按 host+标题在打开的标签中匹配不到 => 页面未打开
+    opt.value = id; // 稳定 key（归一化 URL）
+    const dead = !liveMap[id]; // 按归一化 URL 在打开的标签中匹配不到 => 页面未打开
     const auto = (id === defKey) ? ' ◀默认' : ((activeKey === id) ? ' ◀当前' : '');
-    opt.textContent = `${c.title.slice(0, 28)}（${host}）${dead ? '（页面未打开）' : ''}${auto}`;
+    opt.textContent = `${id.slice(0, 48)}${dead ? '（页面未打开）' : ''}${auto}`;
     if (dead) opt.disabled = true; // 页面未打开的标签不可选，避免误发
     if (id === defKey) opt.selected = true;
     sel.appendChild(opt);

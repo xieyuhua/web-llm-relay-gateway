@@ -77,27 +77,35 @@ function load() { return new Promise(res => chrome.storage.local.get(['targetTab
 function save(targetTabs) { return new Promise(res => chrome.storage.local.set({ targetTabs }, res)); }
 let currentTabs = null; // renderTabs 时缓存，供单标签自动保存使用
 
-// ---------- 稳定身份 key：用「网址 host + 标题」作为存储主键 ----------
+// ---------- 稳定身份 key：归一化网址（origin + pathname，去 query/hash） ----------
 // 避免依赖浏览器临时分配的 tabId（关掉网页再开 tabId 就变了，旧逻辑会误判「已关闭」）
-function normTitle(t) { return (t || '').trim().replace(/\s+/g, ' ').slice(0, 40); }
-function stableKey(tab) {
-  let host = '';
-  try { host = new URL(tab.url || '').host; } catch {}
-  return host + '|' + normTitle(tab.title);
+function normUrl(u) {
+  try {
+    const p = new URL(u || '');
+    if (!/^https?:$/.test(p.protocol)) return (u || '').trim();
+    // 去掉 query 与 hash，仅保留 origin + pathname；去尾斜杠，避免 a/ 与 a 被当作两个页面
+    return (p.origin + p.pathname).replace(/\/+$/, '') || p.origin;
+  } catch {
+    return (u || '').trim();
+  }
 }
+function stableKey(tab) { return normUrl(tab.url); }
 function keyOf(cfg) { return stableKey(cfg); }
-function keyHost(k) { return (k || '').split('|')[0] || ''; }
-function keyTitle(k) { return (k || '').split('|').slice(1).join('|') || ''; }
+// 旧版主键兼容：
+function isOldKey(k) { return (k || '').includes('|'); }
+function oldKeyHost(k) { return (k || '').split('|')[0] || ''; }
+function keyHost(k) { return isOldKey(k) ? oldKeyHost(k) : (() => { try { return new URL(k).host; } catch { return k; } })(); }
+function keyTitle(k) { return isOldKey(k) ? (k || '').split('|').slice(1).join('|') : ''; }
 
 // 数据迁移：旧版用整型 tabId 作为 key，重开网页后 tabId 失效会误判已关闭。
-// 迁移为稳定 key（host|title），并去重合并。
+// 迁移为归一化 URL 主键，并去重合并。
 async function migrateKeys() {
   const tabs = await load();
   const entries = Object.entries(tabs);
   if (!entries.some(([id]) => /^\d+$/.test(id))) return; // 无旧格式，跳过
   const migrated = {};
   for (const [id, c] of entries) {
-    if (/^\d+$/.test(id) && c && c.title) {
+    if (/^\d+$/.test(id) && c && c.url) {
       const nk = keyOf(c);
       if (!migrated[nk]) migrated[nk] = c; // 同站点重复取第一个
     } else {
@@ -155,27 +163,23 @@ async function renderTabs() {
   const ids = Object.keys(tabs);
   empty.style.display = ids.length ? 'none' : 'block';
 
-  // 构建稳定 key -> 真实 tabId 映射：遍历当前打开的标签，按 host+标题匹配（含模糊兜底）
+  // 构建稳定 key -> 真实 tabId 映射：遍历当前打开的标签，按归一化 URL 精确匹配
   liveMap = {};
   const live = await chrome.tabs.query({});
-  const liveNorm = live.filter(t => t.url && /^https?:/.test(t.url)).map(t => {
-    let h = '';
-    try { h = new URL(t.url).host; } catch {}
-    return { id: t.id, host: h, title: normTitle(t.title) };
-  });
+  const liveNorm = live.filter(t => t.url && /^https?:/.test(t.url)).map(t => ({ id: t.id, url: normUrl(t.url) }));
   for (const id of ids) {
-    const kHost = keyHost(id), kTitle = keyTitle(id);
-    let hit = liveNorm.find(t => t.host === kHost && t.title === kTitle);
-    if (!hit) hit = liveNorm.find(t => t.host === kHost && kTitle && t.title && (t.title.includes(kTitle) || kTitle.includes(t.title)));
-    if (!hit && kTitle) {
-      let best = null, bestC = 8;
-      for (const t of liveNorm) {
-        if (t.host !== kHost) continue;
-        let c = 0; const m = Math.min(t.title.length, kTitle.length);
-        while (c < m && t.title[c] === kTitle[c]) c++;
-        if (c >= bestC) { best = t; bestC = c; }
+    let hit;
+    if (isOldKey(id)) {
+      const host = oldKeyHost(id);
+      hit = liveNorm.find(t => { try { return new URL(t.url).host === host; } catch { return false; } });
+    } else {
+      const nk = normUrl(id);
+      hit = liveNorm.find(t => t.url === nk);
+      if (!hit) { // origin 兜底：配置只填了 host 级 URL
+        let origin = '';
+        try { origin = new URL(id).origin; } catch {}
+        if (origin) hit = liveNorm.find(t => { try { return new URL(t.url).origin === origin; } catch { return false; } });
       }
-      hit = best;
     }
     if (hit) liveMap[id] = hit.id; // 多个同站点标签取第一个匹配
   }
@@ -184,7 +188,7 @@ async function renderTabs() {
     const c = tabs[id];
     const alive = !!liveMap[id]; // 稳定 key 在当前打开的标签中存在即视为「已激活」
     const card = document.createElement('article');
-    card.className = 'card collapsed' + (c.enabled ? ' on' : '') + (alive ? '' : ' dead');
+    card.className = 'card' + (c.enabled ? ' on' : '') + (alive ? '' : ' dead') + ' collapsed';
     card.dataset.tabId = id;
     let host = '';
     try { host = new URL(c.url || '').host; } catch {}
@@ -196,7 +200,7 @@ async function renderTabs() {
         <div class="card-summary">
           ${fav}
           <div class="meta">
-            <div class="ct">${escapeHtml(c.title || ('标签 ' + id))}</div>
+            <div class="ct">${escapeHtml(c.title || id)}</div>
             <div class="cu">${escapeHtml(host || c.url || '')}</div>
           </div>
           <div class="chips">
@@ -250,7 +254,7 @@ async function testSelector(key, selector, wantFirst, outEl) {
   const tabId = liveMap[key];
   if (tabId == null) {
     outEl.className = 'test-out warn';
-    outEl.textContent = '⚠ 该页面当前未打开（host=' + keyHost(key) + '，标题≈「' + keyTitle(key) + '」），请打开对应网页后点「测试」';
+    outEl.textContent = '⚠ 该页面当前未打开（identity=' + key + '），请打开对应网页后点「测试」';
     return;
   }
   try {
@@ -293,8 +297,24 @@ async function syncPanel(c, panel, id) {
   syncPanelTable(panel);
   c.sseField = panel.querySelector('.sseField').value;
   c.ssePreset = panel.querySelector('.preset').value;
-  if (id != null && currentTabs) { currentTabs[id] = c; await save(currentTabs); }
+  // 页面身份：url 与 存储键（identity）均可编辑
+  c.url = panel.querySelector('.url').value.trim();
+  const ikeyVal = panel.querySelector('.ikey').value.trim();
+  // 存储键（identity）：手动填写优先；留空则按 url 归一化（origin + pathname）自动重算
+  const newKey = ikeyVal ? normUrl(ikeyVal) : stableKey({ url: c.url });
+  if (id != null && currentTabs) {
+    if (newKey !== id) {
+      // 主键变更：删除旧键、以新键保存（保留全部其它字段）
+      delete currentTabs[id];
+      currentTabs[newKey] = c;
+      id = newKey;
+    } else {
+      currentTabs[id] = c;
+    }
+    await save(currentTabs);
+  }
   notify();
+  return id; // 可能已迁移到新键
 }
 
 // 顶部状态提示
@@ -307,7 +327,7 @@ function flashStatus(msg) {
 }
 
 // 生成可编辑表单 HTML（编辑弹窗与卡片共用结构）
-function tabFormHTML(c) {
+function tabFormHTML(c, id) {
   return `
     <fieldset class="sub">
       <legend>① 网关连接（本页独立）</legend>
@@ -326,6 +346,16 @@ function tabFormHTML(c) {
         </label>
       </div>
       <label class="check"><input type="checkbox" class="autoConnect" ${c.autoConnect !== false ? 'checked' : ''}/> 启用时自动连接此网关</label>
+    </fieldset>
+    <fieldset class="sub">
+      <legend>①-0 页面身份（用于运行时匹配网页）</legend>
+      <label>页面 URL
+        <input type="text" class="url" placeholder="https://chatgpt.com/..." value="${escapeAttr(c.url)}" />
+      </label>
+      <label>存储键 / identity（即归一化网址，运行时按此精确匹配已打开的网页）
+        <input type="text" class="ikey" placeholder="https://chatgpt.com/c/abc （留空则按上方 URL 自动归一化）" value="${escapeAttr(id)}" />
+      </label>
+      <p class="hint">提示：identity 默认 = 上方 URL 归一化（origin + pathname，去掉 ?query 与 #hash）。运行时已打开且归一化 URL 一致的网页即视为匹配。可手动填写以覆盖自动归一化结果。</p>
     </fieldset>
     <fieldset class="sub">
       <legend>② 网页监听（本页独立）</legend>
@@ -372,13 +402,13 @@ function openEditModal(id) {
   const c = currentTabs && currentTabs[id];
   if (!c) return;
   if (liveMap[id] == null) {
-    flashStatus('该页面当前未打开（host=' + keyHost(id) + '，标题≈「' + keyTitle(id) + '」），打开对应网页后即可编辑并测试');
+    flashStatus('该页面当前未打开（identity=' + id + '），打开对应网页后即可编辑并测试');
     // 仍打开弹窗允许编辑配置，仅测试会提示未打开
   }
   editId = id;
   document.getElementById('editTitle').textContent = c.title || ('标签 ' + id);
   const body = document.getElementById('editBody');
-  body.innerHTML = tabFormHTML(c);
+  body.innerHTML = tabFormHTML(c, id);
   const rule = parseSseRule(c.sseField);
   renderMapTable(body.querySelector('.map-table tbody'), rule);
   const presetSel = body.querySelector('.preset');
@@ -566,10 +596,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const c = currentTabs[editId];
     if (!c) return;
     const body = document.getElementById('editBody');
-    await syncPanel(c, body, editId);
+    const newId = await syncPanel(c, body, editId);
+    editId = newId; // 若存储键被修改，更新当前编辑 id
     closeEditModal();
     renderTabs();
-    flashStatus('已保存：' + (c.title || editId) + ' ✓');
+    flashStatus('已保存：' + (c.title || newId) + ' ✓');
   });
   document.getElementById('saveAll').addEventListener('click', async () => {
     const cc = await load(); // 当前已自动保存，这里做一次兜底持久化
@@ -579,6 +610,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     flashStatus('全部配置已保存 ✓');
   });
 
-  await migrateKeys(); // 旧版整型 tabId 存储迁移为稳定 key（host|title）
+  await migrateKeys(); // 旧版整型 tabId 存储迁移为归一化 URL 主键（host|标题 旧键由 isOldKey 兜底兼容）
   await renderTabs();
 });

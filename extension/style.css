@@ -133,12 +133,13 @@ button{font-family:inherit; cursor:pointer; border:0; border-radius:9px; font-si
 .del:hover{color:#fff; background:var(--red); border-color:var(--red);}
 .card-body{padding:4px 16px 16px; border-top:1px solid var(--line);}
 .card.collapsed .card-body{display:none;}
-/* 只读概览视图 */
-.view{display:grid; grid-template-columns:1fr 1fr; gap:8px 18px; padding:6px 0 4px;}
+/* 只读概览视图：单列，一个字段一行 */
+.view{display:grid; grid-template-columns:1fr; gap:6px 0; padding:6px 0 4px;}
 .kv{display:flex; gap:8px; align-items:baseline; font-size:12.5px; min-width:0;}
 .kv span{flex:0 0 auto; color:var(--muted); width:88px;}
-.kv b{flex:1; min-width:0; font-weight:600; color:var(--txt); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.kv b{flex:1; min-width:0; font-weight:600; color:var(--txt); overflow-wrap:anywhere; word-break:break-all;}
 .kv b.mono{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; color:var(--cyan);}
+.hint{font-size:11.5px; color:var(--dim); margin:6px 0 2px; line-height:1.5;}
 @media (max-width:560px){ .view{grid-template-columns:1fr;} }
 /* 字段分区 */
 .sub{border:1px solid var(--line); border-radius:11px; padding:10px 14px 14px; margin:12px 0 0; background:var(--field2);}
