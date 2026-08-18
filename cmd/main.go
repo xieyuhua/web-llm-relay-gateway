@@ -5,6 +5,7 @@ import (
 	"log"
 	nethttp "net/http"
 	"os"
+	"time"
 
 	"gateway/internal/config"
 	httphandler "gateway/internal/http"
@@ -22,8 +23,8 @@ func main() {
 	// 启动参数 -debug 或环境变量 RELAY_DEBUG 或 config.yaml 的 debug 任一为真即开启
 	debug := *debugFlag || cfg.Debug || os.Getenv("RELAY_DEBUG") == "1" || os.Getenv("RELAY_DEBUG") == "true"
 
-	taskMgr := task.NewManager()
-	hub := ws.NewHub(taskMgr, cfg.AuthToken, debug)
+	taskMgr := task.NewManager(time.Duration(cfg.TaskTimeout) * time.Second)
+	hub := ws.NewHub(taskMgr, cfg.AuthToken, debug, cfg.Concurrency.MaxQueue)
 	handler := httphandler.New(cfg, hub, taskMgr)
 
 	mux := nethttp.NewServeMux()

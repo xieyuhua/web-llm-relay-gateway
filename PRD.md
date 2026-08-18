@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 文档版本 | v1.1 |
+| 文档版本 | v1.1（已对齐当前代码实现，2026-08-18 复核） |
 | 状态 | 已实现端到端最小可跑版本（第一阶段 + 第二阶段核心链路） |
 | 负责人 | 后端 / 插件开发 |
-| 最后更新 | 2026-08-17 |
+| 最后更新 | 2026-08-18 |
 
 ---
 
@@ -68,31 +68,43 @@ Golang 后端 (main.exe)  ─── WebSocket (内部 JSON 协议) ──▶  �
 
 | 接口 | 方法 | 鉴权 | 说明 |
 |---|---|---|---|
-| `/v1/chat/completions` | POST | 是 | 核心对话，支持 `stream=true/false` |
-| `/v1/models` | GET | 是 | 返回在线实例列表（每个在线实例一条，ID=instance_id；同 tag 多实例时额外追加 tag 聚合入口） |
+| `/v1/chat/completions` | POST | 是（`auth_token` 非空时） | 核心对话，支持 `stream=true/false` |
+| `/v1/models` | GET | 是（`auth_token` 非空时） | 返回在线实例列表（每个在线实例一条，ID=instance_id；同 tag 多实例时额外追加 tag 聚合入口） |
 | `/healthz` | GET | 否 | 健康检查，返回在线实例数与实例明细 |
-| `/v1/chat/cancel` | POST | 是 | 取消进行中任务，body `{"task_id":"..."}` |
-| `/` 或 `/test` | GET | 否 | 内置对接自检测试台 |
-| `/ws` | GET(WS) | 是 | 插件注册通道（`?token=` 必填，与 `config.yaml` 的 `auth_token` 一致），query 带 `instance_id`/`tag`/`models` 自动注册 |
+| `/v1/chat/cancel` | POST | 是（`auth_token` 非空时） | 取消进行中任务，body `{"task_id":"..."}` |
+| `/` 或 `/test` | GET | 否 | 内置对接自检测试台（`web/test.html`，由 `//go:embed` 打包进二进制） |
+| `/ws` | GET(WS) | 是（`auth_token` 非空时，query `?token=`） | 插件注册通道；query 带 `instance_id`/`tag`/`models` 自动注册，并校验 token |
 
-- 请求体严格对齐 OpenAI schema（`model` / `messages` / `stream` / `temperature` 等透传）。
+- 请求体对齐 OpenAI schema（`model` / `messages` / `stream` / `temperature` 等透传，但 `temperature` 仅透传，中继不强制使用）。
 - 流式响应逐块透传 `choices[].delta.content`；非流式在 `response` 收齐后返回完整 `choices[].message.content`。
 
 ### FR-2 多实例聚合与路由
 
-- 每个插件实例连接时自动注册，携带 `instance_id`（形如 `inst-<前缀>-<tabId>`，前缀按浏览器 profile 持久化）、`tag`、`models`。
-- 请求 `model` 的路由优先级：
-  1. **精确 instance_id**：等于某在线实例的 `instance_id` → 路由到该**具体标签页**（按实例精确选择）。
-  2. **tag 名**：等于某在线实例上报的 `tag`（如 `chatgpt` / `chatgpt-web-3`）→ 在该 tag 在线实例中按「当前并发任务数最少 + 轮询」负载均衡。
-  3. **配置 model / `auto`**：回退到 `config.yaml` 的 `models` 声明；`auto` 在全部在线实例中择优。
-- ⚠️ `tag` 不做首段截断：`chatgpt-web-3` 即完整 tag，调用 `model: "chatgpt-web-3"` 直接命中上报了该 tag 的实例。
-- `tag` / 精确 id 下无在线实例 → 返回 `503`，message 提示「无可用实例」。
+- 每个插件实例连接 `/ws` 时通过 query 参数自动注册，携带 `instance_id`、`tag`、`models`。
+- 请求 `model` 的路由匹配规则（见 `internal/ws/hub.go` 的 `pickInstance` / `modelTag`）：
+  1. **精确 instance_id**：等于某在线实例的 `instance_id` → 路由到该**具体标签页**（按实例精确选择）。`/v1/models` 会为每个实例返回一条以 `instance_id` 为 ID 的模型，供精确路由。
+  2. **tag 名**：等于某在线实例上报的 `tag`（如 `chatgpt` / `chatgpt-web-3`）→ 在该 tag 在线实例中按「**当前排队最短**」择优（负载均衡）。
+  3. **前缀截断**：若 `model` 不等于任何完整 `tag`，则取 `model` 以 `-` 分隔的**首段**作为 `tag` 匹配（例如 `chatgpt-web-3` 在不存在完整 `chatgpt-web-3` tag 时，截断为 `chatgpt` 匹配 `tag=chatgpt` 的实例）。
+- ⚠️ `tag` 默认路径下会被首段截断：`chatgpt-web-3` 若想精确命中，需把实例 `tag` 显式配成完整串 `chatgpt-web-3`。
+- 选定的 `tag` / 精确 id 下无在线实例 → 返回 `503`，message 提示「no available instance for model」。
+
+### FR-2.1 单实例串行与排队（并发控制）
+
+- **核心约束**：每个 WS 实例（一个浏览器标签页）**同一时刻只允许 1 个客户端在网页上操作**，防止多对话在同一页面交叉污染。
+- **串行执行**：实例内部维护 FIFO 队列（`serve()` 协程），每次只把队首任务下发 `task.create`，该任务 `done` 后再处理下一个。
+- **可配置排队**：`config.yaml` 的 `concurrency.max_queue` 控制「除正在执行的 1 个外，还能排队多少个」。
+  - `max_queue: 0` → 严格串行，第 2 个并发请求立即被拒（最严，适合单账号防风控）；
+  - `max_queue: N`（默认 3）→ 允许 N 个请求挂起等待，表现为「稍等片刻」。
+- **排队满拒绝**：实例队列已达 `max_queue` 时，新请求返回 `503`，响应体 `{"error":"系统繁忙，请稍后再试（服务器并发已达上限）"}`，**不卡连接**。
+- **多实例并行**：同 `tag` 多实例在线时按「队列最短」路由，各实例各自串行、彼此并行，横向扩展吞吐。
+- **不丢任务**：排队请求的 HTTP 连接保持打开（SSE 挂起），前序任务结束后自动调度；`task_timeout`（默认 120s）超时保护覆盖排队阶段，不会死锁。
 
 ### FR-3 任务生命周期管理
 
 - 每轮对话生成 `task_id`，状态机：`pending → running → done / error / timeout / cancelled`。
-- 超时：120s 内未收到 `done` 则标记 `timeout` 并以 SSE error 结束。
+- 超时：`task_timeout`（默认 120s，见 `config.yaml`）内未收到 `done` 则标记 `timeout` 并以 SSE error 结束。
 - 取消：客户端调 `/v1/chat/cancel` → 后端向实例下发 `task.cancel` → 插件侧 `AbortController.abort()` 中断页面请求。
+- **排队语义**：请求入队时即生成 `task_id` 并创建任务（`pending`），仅当轮到该实例执行时才进入 `running` 并下发 `task.create`；排队期间 HTTP 连接挂起等待，前序任务 `done` 后自动转为执行。
 - **手动模式任务上下文清理（实现补充）**：手动对话由 Popup 驱动，content.js 维护任务上下文 `cur`。一次对话完成后，Popup 收到 `task.done`/`task.error` 时下发 `task.finished` 消息通知 content.js 清空 `cur`；并设 120s 超时兜底，确保 `cur` 不会永久残留。不同 `task_id` 的新对话可直接接管（避免「上一次未清空导致二次对话被拦截」）。
 
 ### FR-4 网页流式捕获（双通道 + 兜底）
@@ -109,7 +121,7 @@ Golang 后端 (main.exe)  ─── WebSocket (内部 JSON 协议) ──▶  �
 - 连接：`WS URL`、`Token`、`Tag`。
 - DOM 选择器：输入框、发送按钮、回答区。
 - 适配参数：对话接口路径后缀、SSE 字段映射（含 `reasoning_content` 支持思考链模型）。
-- **平台预设**：内置 `openai` / `stepfun` / `claude` 三套选择器 + 字段映射，一键填入；其余站点手动配置。
+- **平台预设**：内置 `openai` / `stepfun` / `claude` 三套预设（URL + 选择器 + 字段映射）尚未在代码中落地，当前 `options.js` 仅内置 `stepfun` 一套；其余站点（`openai` / `claude` 等）需手动配置。
 
 ### FR-6 运行模式
 
@@ -119,12 +131,12 @@ Golang 后端 (main.exe)  ─── WebSocket (内部 JSON 协议) ──▶  �
 ### FR-7 可靠性
 
 - 断线指数退避重连（1s 起，上限 30s），`tag` 等配置持久化于 `chrome.storage.local`，重连后自动重新注册。
-- 单实例串行执行，后端标记 `busy` 避免任务叠加。
+- 单实例串行执行（FIFO 队列 + `serve()` 协程），后端以 `503 系统繁忙` 拒绝超量并发，避免任务叠加与页面交叉。
 - 主世界 / 隔离世界双通道互补，提升不同站点、不同 CSP 策略下的流式捕获成功率。
 
 ## 6. 内部协议（WebSocket JSON）
 
-实例注册由 **WS 连接 query 参数**自动完成（`?instance_id=&tag=&models=&token=`），无需单独的 `register` 消息。心跳通过前端 `ping` 帧推进 `LastPing`。
+实例注册由 **WS 连接 query 参数**自动完成（`?instance_id=&tag=&models=&token=`），`token` 校验与 `config.yaml` 的 `auth_token` 一致（未配置则放行）；也可通过 `instance.register` 消息体二次注册。后端回 `register.ack`。心跳通过后端周期性 `ping` 帧 + 前端 `pong` 推进 `LastPing`。
 
 ```
 插件(隔离/主世界) → 后端:
@@ -135,7 +147,7 @@ Golang 后端 (main.exe)  ─── WebSocket (内部 JSON 协议) ──▶  �
   task.status  {type, task_id, status, message}         // 状态变更（可选）
 
 后端 → 插件(background.js):
-  task.create  {type, task_id, model, messages, stream, temperature}  // 下发任务（含完整对话参数）
+  task.create  {type, task_id, model, messages, stream}  // 下发任务（协议含 selector/send_button_selector/answer_selector 字段，当前由插件侧从卡片配置注入）
   task.cancel  {type, task_id}                              // 取消指令（插件侧 AbortController.abort）
 
 插件内部（background.js → content.js）:
@@ -151,11 +163,12 @@ Golang 后端 (main.exe)  ─── WebSocket (内部 JSON 协议) ──▶  �
 
 | code | 含义 |
 |---|---|
-| 400 | 请求体解析失败 / 缺 messages |
-| 401 | Token 缺失或错误（HTTP Bearer 或 WS `?token=`） |
-| 404 | model 未知且无匹配 tag / instance_id |
-| 503 | 目标 tag / 实例无在线实例 |
-| 504 | 任务超时（120s） |
+| 400 | 请求体解析失败 / 缺 messages / **model 为空或无可匹配实例（unsupported model）** |
+| 401 | Token 缺失或错误（仅 HTTP Bearer，用于 `/v1/*`） |
+| 503 | 目标 tag / 实例无在线实例（no available instance for model）；或实例**排队已满**（系统繁忙，响应体含「服务器并发已达上限」） |
+| — | 任务超时（`task_timeout` 默认 120s）**不返回 504**，而是以 SSE `error` 事件结束流式响应 |
+
+> 注：早期设计中的 `404`（model 未知）、`504`（超时）在当前实现中分别由 `400` 与「SSE error 事件」替代。
 
 插件侧 `task.error` 业务码（常见，供前端展示）：
 

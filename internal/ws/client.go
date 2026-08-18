@@ -8,8 +8,17 @@ import (
 	"sync"
 	"time"
 
+	"gateway/internal/task"
+
 	"github.com/gorilla/websocket"
 )
+
+// pendingTask 实例串行队列中的待处理任务。
+type pendingTask struct {
+	taskID string
+	task   *task.Task
+	env    *Envelope // 待下发给插件的 task.create 报文
+}
 
 // Client 封装单个插件实例的 WebSocket 连接。
 type Client struct {
@@ -24,28 +33,65 @@ type Client struct {
 	hub         *Hub
 	sendCh      chan []byte
 	closeCh     chan struct{}
+	queue       chan *pendingTask // 串行执行队列：同一时刻仅队首任务真正在网页上操作
 }
 
 // NewClient 创建客户端。
 func NewClient(conn *websocket.Conn, hub *Hub) *Client {
-	return &Client{
+	c := &Client{
 		conn:    conn,
 		Online:  true,
 		sendCh:  make(chan []byte, 64),
 		closeCh: make(chan struct{}),
 		hub:     hub,
+		queue:   make(chan *pendingTask, 256),
+	}
+	go c.serve()
+	return c
+}
+
+// serve 串行消费本实例的任务队列：保证同一时刻只有 1 个客户端在网页上操作。
+// 取队首任务 → 下发 task.create → 阻塞等待其 DoneCh → 再处理下一个。
+func (c *Client) serve() {
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case pt := <-c.queue:
+			// 若任务在排队期间已被超时/取消终态，直接跳过（HTTP 侧已收到结束）
+			if pt.task.Status == task.StatusDone || pt.task.Status == task.StatusFailed || pt.task.Status == task.StatusCancelled {
+				continue
+			}
+			if err := c.Send(pt.env); err != nil {
+				c.hub.taskMgr.Fail(pt.taskID, "SEND_FAILED", err.Error())
+			}
+			// 等待该任务结束（manager 在 done/fail 时 close(DoneCh)，多等待者均可接收）
+			<-pt.task.DoneCh
+		}
 	}
 }
 
-// Send 下行发送（线程安全）。
+// Send 下行发送（线程安全，异步投递到 sendCh，由 writeLoop 串行写出）。
+// 改为异步是为了避免 HTTP handler 在调用 Send 时同步阻塞写 socket、与
+// writeLoop/ping 抢夺同一把 c.mu 锁，导致同一 WS 实例被多任务并发打满时
+// 整条连接卡死（readLoop 不再读 → 插件回写堆积 → 数据无法流到 agent）。
 func (c *Client) Send(envelope *Envelope) error {
+	if !c.Online {
+		return websocket.ErrCloseSent
+	}
 	b, err := json.Marshal(envelope)
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.WriteMessage(websocket.TextMessage, b)
+	select {
+	case c.sendCh <- b:
+		return nil
+	default:
+		// sendCh 缓冲（64）已满，说明下行已严重积压，直接丢弃并告警，
+		// 绝不阻塞调用方（否则会级联卡死 readLoop）。
+		log.Printf("[ws] instance %s sendCh full, drop msg type=%s", c.InstanceID, envelope.Type)
+		return nil
+	}
 }
 
 // incrTasks / decrTasks 调整并发任务计数（负载均衡用）。

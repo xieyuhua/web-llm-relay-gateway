@@ -22,3 +22,13 @@ rate_limit:
   enabled: false
   qps: 10
   max_tasks: 50
+
+# 单实例串行与排队控制：每个 WS 实例同一时刻仅 1 个客户端在网页操作，
+# 其余请求进入队列等待，队列满后返回 503 系统繁忙。
+concurrency:
+  max_queue: 0                    # 每实例允许排队的最大请求数（不含正在执行的 1 个）；0=严格串行
+  max_concurrent_per_instance: 1  # 单实例同时执行任务数（本系统强制为 1，保留字段）
+
+# 单任务超时时间（秒）。从任务创建到完成（done/failed）的全局上限，
+# 超时后任务被标记为 timeout 并失败。环境变量 TASK_TIMEOUT 可覆盖。
+task_timeout: 120

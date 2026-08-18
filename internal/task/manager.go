@@ -36,16 +36,20 @@ type Task struct {
 
 // Manager 任务管理器（内存 sync.Map）。
 type Manager struct {
-	mu    sync.RWMutex
-	tasks map[string]*Task
+	mu         sync.RWMutex
+	tasks      map[string]*Task
+	taskTimeout time.Duration
 }
 
-// NewManager 创建管理器。
-func NewManager() *Manager {
-	return &Manager{tasks: make(map[string]*Task)}
+// NewManager 创建管理器。timeout 为单任务超时上限，<=0 时回退到 120s。
+func NewManager(timeout time.Duration) *Manager {
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	return &Manager{tasks: make(map[string]*Task), taskTimeout: timeout}
 }
 
-// Create 创建任务并启动超时计时（默认 120s）。
+// Create 创建任务并启动超时计时（超时时长由 NewManager 配置决定，默认 120s）。
 func (m *Manager) Create(id, model, instanceID string) *Task {
 	t := &Task{
 		ID:         id,
@@ -57,8 +61,8 @@ func (m *Manager) Create(id, model, instanceID string) *Task {
 		DoneCh:     make(chan struct{}),
 		CancelCh:   make(chan struct{}),
 	}
-	t.timeout = time.AfterFunc(120*time.Second, func() {
-		m.Fail(id, "TASK_TIMEOUT", "task exceeded 120s")
+	t.timeout = time.AfterFunc(m.taskTimeout, func() {
+		m.Fail(id, "TASK_TIMEOUT", "task exceeded "+m.taskTimeout.String())
 	})
 	m.mu.Lock()
 	m.tasks[id] = t
@@ -83,9 +87,18 @@ func (m *Manager) OnAck(id string) {
 }
 
 // OnDelta 收到流式增量，推入 DeltaCh。
+// 使用非阻塞写入：一旦 DeltaCh（容量 256）被消费方（HTTP SSE 写出）积压填满，
+// 直接丢弃该帧并告警，绝不在 readLoop 中阻塞——否则 readLoop 卡住后将不再
+// 从 socket 读消息，导致整条 WS 连接僵死（插件侧已回写，但 Go 侧无法再读/转发）。
 func (m *Manager) OnDelta(id, payload string) {
-	if t, ok := m.Get(id); ok && t.Status != StatusDone && t.Status != StatusFailed {
-		t.DeltaCh <- payload
+	t, ok := m.Get(id)
+	if !ok || t.Status == StatusDone || t.Status == StatusFailed {
+		return
+	}
+	select {
+	case t.DeltaCh <- payload:
+	default:
+		log.Printf("[task] %s delta channel full, drop a delta frame (consumer too slow)", id)
 	}
 }
 

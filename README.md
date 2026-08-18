@@ -1,103 +1,118 @@
-# 网页大模型聚合网关 (Web LLM Relay Gateway)
+# StepFun Relay
 
-把「已登录的网页版大模型」（ChatGPT / Claude / StepFun / Gemini 等）包装成标准 **OpenAI-compatible `/v1/chat/completions`** 接口，让任意兼容 OpenAI SDK 的客户端（Python / Node / curl / Agent 框架）直接驱动网页模型——**无需逆向官方 API、无需自备 Key、凭据始终留在浏览器本地**。
-
-> 本仓库实现 PRD v1.0 端到端最小可跑版本：Golang 后端 + Chrome MV3 插件。
+> 通过浏览器插件把任意「Web 聊天页面」（StepFun、ChatGPT-WEB、DeepSeek 等）伪装成标准 **OpenAI 兼容** 的 `/v1/chat/completions` 接口，供上层 MCP / 客户端以 `model: chatgpt` 等方式无缝调用。
+> 也就是把「网页聊天框」当成一台模型服务器来用。
 
 ---
 
-## 1. 它能做什么
+## 0. 目录约定
 
-- **OpenAI 兼容**：`/v1/chat/completions`（`stream=true/false`）、`/v1/models`、`/healthz`、取消接口。
-- **多实例聚合**：多个浏览器标签页（甚至多台机器）上的插件实例，按 `tag` 分组路由，支持同 tag 下「并发最少者优先 + 轮询」负载均衡；也支持**按 `instance_id` 精确路由到某个具体标签页**。
-- **网页无关**：输入框 / 发送按钮 / 对话接口路径 / SSE 字段结构全部在 Options 中手动配置，不写死适配某个站点。
-- **选择器任意复杂**：支持任意原生 CSS 选择器（含组合符 `>`、`+`、`~`，伪类 `:not()`、属性选择器 `[variant=inset]`），也支持 XPath（以 `//`、`/html`、`(//` 开头自动识别）。子 iframe 内元素自动跨 frame 定位。
-- **多标签页独立监听 + 独立网关连接**：每个选项卡 = 一个网页 = 一套**完整独立配置**（独立 WS URL / Token / Tag / 模型 / 选择器 / 字段映射），可分别连接不同网关。
-- **双世界流式捕获**：
-  - `bridge.js`：注入页面**隔离世界**（content script 上下文），拦截页面 `fetch` / `XMLHttpRequest` 流式响应。
-  - `pageBridge.js`：注入页面**主世界**（`world: 'MAIN'`），直接 hook 页面真实 `fetch` / `XHR` / 原生 `EventSource`，可抓取隔离世界看不到的请求（部分站点真实请求只发生在主世界）。两者互补，覆盖绝大多数站点。
-- **兜底**：上述拦截通道因 CSP 受限时，`content.js` 用 `MutationObserver` 监听回答区节点回传新增文本。
-- **实例自动注册 + 鉴权**：插件连接网关即自动注册（无需手工预申报），网关强制校验 `token`，杜绝伪造实例。
+| 路径 | 说明 |
+|------|------|
+| `cmd/main.go` | 进程入口，加载配置、初始化 Hub、启动 HTTP/WS |
+| `internal/config` | YAML 配置加载（`Config` 结构） |
+| `internal/http` | HTTP 路由（`/register`、`/ws`、`/v1/chat/completions`、`/v1/models`、`/v1/chat/cancel`、`/healthz`、`/`、`/test`） |
+| `internal/ws` | WebSocket 连接管理、路由分发、协议编解码 |
+| `internal/task` | 任务生命周期与状态机 |
+| `internal/openai` | OpenAI 请求/响应 Schema 与 SSE 流式封装 |
+| `web/test.html` | 调试页（由 `web/embed.go` 的 `//go:embed *.html` 内嵌进二进制） |
+| `extension/` | 浏览器插件（background / content / popup / options） |
+| `selectorjs` | 辅助脚本：在网页控制台点击元素，打印其 CSS 选择器（见 §12） |
+| `config.yaml` | 运行配置（可选，缺失时回退内置默认值） |
+
+> 仓库历史上曾有一个 `cmd/simws/` 模拟客户端用于本地联调，当前版本已移除（直接由 `extension/` 作为真实客户端）。如需本地模拟，可自行用任意 WebSocket 客户端实现 `instance.register` / `task.*` 协议。
+
+---
+
+## 1. 背景与动机
+
+许多「网页版对话」产品没有 OpenAI 兼容 API，但上层 MCP / 应用只认 `chat/completions`。
+本项目用**浏览器插件 + 中继服务器**的方式，把「在网页里打字 → 等回复」这一过程，映射成一次标准的 OpenAI 流式对话请求。
+
+- **插件**：登录目标网页账号、打开聊天页、在后台注入脚本监听 DOM 文本变化、把回答回传给中继；
+- **中继**：对上层暴露 OpenAI 风格接口，把请求转成 WebSocket 指令下发给插件，再把插件的增量回复转成 SSE 流。
 
 ---
 
 ## 2. 整体架构
 
 ```
-终端调用方 (OpenAI SDK / curl / Agent)
-   │  POST /v1/chat/completions (SSE)
-   ▼
-Golang 后端 (main.exe)
-   │  WebSocket (内部 JSON 协议，?token= 鉴权)
-   ▼
-浏览器插件 (MV3, background.js)
-   │  content script → 网页 JS 桥接（隔离世界 + 主世界）
-   ▼
-网页版大模型 (已登录)
+┌──────────────┐   OpenAI 兼容 HTTP    ┌─────────────────┐   WebSocket    ┌──────────────┐
+│  上层 MCP /   │ ──────── HTTP ──────▶ │  StepFun Relay  │ ────── WS ────▶ │  浏览器插件   │
+│  客户端       │ ◀────── SSE ───────── │  (本仓库)        │ ◀───────────── │ (后台)        │
+└──────────────┘                       └─────────────────┘                 └──────┬───────┘
+                                                                                   │ 注入脚本
+                                                                                   ▼
+                                                                          ┌────────────────┐
+                                                                          │ 目标聊天网页     │
+                                                                          │ (StepFun/等)    │
+                                                                          └────────────────┘
 ```
 
-**两种使用模式**：
-
-| 模式 | 是否经后端 | 触发方式 | 回传展示 |
-|---|---|---|---|
-| **手动模式** | 否（纯本地） | Popup 选标签页 → 输入 → 发送 | 弹窗内流式展示 |
-| **接口驱动模式** | 是 | 任意 OpenAI 客户端 `POST /v1/chat/completions` | 经 WS 上行 → 后端透传 OpenAI SSE |
+- **多对多**：一个中继可接入多个插件实例（`instance_id` + `tag` 区分），一个实例可声明多个 `models`。
+- **负载均衡**：同 `tag` / 同 `model` 下多个在线实例，按「当前排队最短」择优选一个，同负载时轮询打散。
+- **单实例串行**：每个实例内部同一时刻只执行 1 个任务，其余请求排队（见 §6.6），避免单页多对话交叉。
+- **可用性**：某实例离线/忙碌，自动换下一个实例；全部不可用则返回错误。
 
 ---
 
-## 3. 目录结构
+## 3. 核心概念
 
-```
-.
-├── cmd/
-│   ├── main.go          # 后端入口（读取 config.yaml，装配 Hub/TaskManager/HTTP Handler）
-│   └── simws/           # 模拟插件 WS 客户端（测试用，无需真实浏览器）
-├── internal/
-│   ├── config/          # 运行时配置（config.yaml 解析）
-│   ├── http/            # HTTP 路由 (chat/models/health/cancel) + SSE 透传
-│   ├── ws/              # WebSocket Hub + 协议 + 客户端封装 + 负载均衡路由
-│   ├── task/            # 任务状态机 + 120s 超时 + 取消
-│   └── openai/          # OpenAI schema（请求/响应/SSE 序列化）
-├── web/                 # 内置测试网页（embed 进二进制）
-│   └── test.html        # 网关对接测试台
-├── extension/           # 浏览器插件 (MV3) —— 加载此目录
-│   ├── manifest.json
-│   ├── background.js    # WS 客户端 + 任务编排 + 指数退避重连 + 实例自动注册
-│   ├── content.js       # DOM 操控 + MutationObserver 兜底 + 元素探测 + 回传转发
-│   ├── bridge.js        # 注入【隔离世界】拦截 fetch/XHR 流式 + AbortController
-│   ├── pageBridge.js    # 注入【主世界】hook 真实 fetch/XHR/EventSource 流式
-│   ├── popup.html/js    # 手动模式弹窗 + 实例连接状态面板 + 元素探测开关
-│   ├── options.html/js  # 每标签页独立配置：WS 地址 / Token / Tag / 选择器 / SSE 字段映射
-│   └── style.css
-├── main.exe             # 编译产物（Windows）
-├── config.yaml          # 运行时配置
-└── go.mod
-```
-
-> ⚠️ **加载目录**：Chrome 加载的是 `extension/` 目录（manifest 所在）。`extension - 副本/` 等其它目录不会被加载，请勿混淆。
+| 概念 | 说明 |
+|------|------|
+| `instance_id` | 插件实例唯一 ID（由插件生成，建议含随机串以避免多开冲突） |
+| `tag` | 实例分组标签，用于多实例分流（如 `chatgpt`、`deepseek`、`step`） |
+| `models` | 该实例对外声明的模型名列表（用于 `/v1/models` 回退与展示） |
+| `task_id` | 一次对话任务的 ID，贯穿 HTTP → WS → 回传全链路 |
+| `card` | 插件侧「站点卡片」配置：URL、选择器、字段映射规则 |
+| `finish_reason` | 任务结束原因：`stop` / `cancelled`（SSE）/ `timeout`（经 SSE error） |
 
 ---
 
-## 4. 后端运行
+## 4. 安装与运行
 
-```powershell
-$env:GOPROXY="off"        # 离线环境用本地缓存；正常联网可省略
-go build -o main.exe ./cmd
-.\main.exe
+### 4.1 中继服务器
+
+```bash
+# 构建
+go build -o relay.exe ./cmd
+# 运行（可选配置文件，缺失则用内置默认值）
+./relay.exe -config config.yaml
 ```
 
-后端默认读取同目录 `config.yaml`，监听地址下的 WebSocket 路径为 `/ws`。
+或：
 
-### 4.1 `config.yaml`
+```bash
+go run ./cmd -config config.yaml
+```
+
+启动后：
+- HTTP（含 WS）监听 `:8090`（内置默认，见 `config.yaml` 的 `http_addr`）；
+- 浏览器访问 `http://localhost:8090/` 或 `http://localhost:8090/test` 打开调试页（`web/test.html`，已内嵌进二进制）。
+
+### 4.2 浏览器插件
+
+1. 打开 `chrome://extensions` → 开启「开发者模式」；
+2. 「加载已解压的扩展程序」→ 选择本仓库的 `extension/` 目录；
+3. 在 Options 页填写本机服务地址（默认 `ws://localhost:8090/ws`）、`token`、目标站点卡片；
+4. 打开对应聊天网页，插件自动连接 `/ws` 并完成注册。
+
+> 仓库已附带 `extension.crx` / `extension.pem`（打包产物）。日常开发调试用「加载已解压」即可。
+
+---
+
+## 5. 配置说明（`config.yaml`）
+
+字段以 `internal/config/config.go` 的 `Config` 结构为准。缺失项回退内置默认值（也支持环境变量 `HTTP_ADDR` / `AUTH_TOKEN` 覆盖）。
 
 ```yaml
-# 网页大模型聚合网关配置
-http_addr: ":8191"          # 监听地址，环境变量 HTTP_ADDR 可覆盖
-ws_path: "/ws"              # WebSocket 升级路径
-api_prefix: "/v1"           # OpenAI API 前缀
-auth_token: "sk-demo-token" # Bearer Token，环境变量 AUTH_TOKEN 可覆盖
+http_addr: ":8090"          # HTTP 与 WebSocket 监听地址（默认 :8090）
+ws_path: "/ws"              # WebSocket 路径（默认 /ws）
+api_prefix: "/v1"           # OpenAI 接口前缀（默认 /v1）
+auth_token: "sk-demo-token" # 鉴权 Token；非空时 /v1/* 与 /ws 均需携带
+debug: false                # true 时打印所有 WS 收发报文
 
-# 模型路由表：对外 model 名 -> 插件实例 tag
+# 模型路由声明（仅用于「无在线实例时」/v1/models 回退展示；在线时以插件上报为准）
 models:
   - id: "chatgpt-web"
     owned_by: "chatgpt"
@@ -113,268 +128,271 @@ rate_limit:
   enabled: false
   qps: 10
   max_tasks: 50
+
+# 单实例串行与排队（核心能力）
+concurrency:
+  # 每个 WS 实例（浏览器标签页）允许排队等待的最大请求数（不含正在执行的 1 个）。
+  # 0 = 严格串行，任何第 2 个并发请求立即被拒；3 = 1 个执行 + 3 个排队，第 5 个被拒。
+  max_queue: 3
+  # 单实例同时执行任务数（本系统强制为 1，保留字段便于未来扩展并行）。
+  max_concurrent_per_instance: 1
+
+# 单任务超时时间（秒）。从任务创建到完成（done/failed）的全局上限，
+# 超时后任务被标记为 timeout 并以 SSE error 结束。默认 120。环境变量 TASK_TIMEOUT 可覆盖。
+task_timeout: 120
 ```
 
-环境变量覆盖：`HTTP_ADDR`（→ `http_addr`）、`AUTH_TOKEN`（→ `auth_token`）。
-
-> 注意：`auth_token` 同时保护 `/v1/*`（Bearer）与 `/ws`（query `?token=`），二者必须一致。
-
-### 4.2 接口一览
-
-| 接口 | 方法 | 鉴权 | 说明 |
-|---|---|---|---|
-| `GET /` 或 `/test` | GET | 否 | 内置测试网页（自检对接是否成功） |
-| `GET /healthz` | GET | 否 | 健康检查（在线实例数 + 实例明细） |
-| `GET /v1/models` | GET | 是 | 模型列表（每在线实例一条，ID=`instance_id`；同 tag 多实例额外追加 tag 聚合入口） |
-| `POST /v1/chat/completions` | POST | 是 | 核心对话（支持 `stream=true/false`） |
-| `POST /v1/chat/cancel` | POST | 是 | 取消进行中任务，body `{"task_id":"..."}` |
-| `GET /ws` | GET(WS) | 是 | 插件 WebSocket 注册通道（`?token=` 必填，与 `auth_token` 一致），query 带 `instance_id`/`tag`/`models` 自动注册 |
+> 注意：早期版本文档中提到的 `log_level`、`heartbeat`、`task.timeout`、`allowed_tags`、`field_mapping` 等字段在当前代码中**不存在**，请勿在 `config.yaml` 中配置（会被忽略）。心跳间隔/超时目前为代码内部常量；如需调整需改源码。任务超时（120s）现在已可通过 `task_timeout` 配置。
 
 ---
 
-## 5. 实例模型与路由规则
+## 6. OpenAI 兼容接口
 
-`/v1/chat/completions` 的 `model` 字段按优先级解析：
+### 6.1 `POST /v1/chat/completions`
 
-1. **精确 `instance_id`**：若 `model` 等于某在线实例的 `instance_id`（形如 `inst-<前缀>-<tabId>`），则路由到该**具体标签页**。
-2. **tag 名**：若 `model` 等于某在线实例上报的 `tag`（如 `chatgpt`、`chatgpt-web-3`），则在该 tag 下所有在线实例中按「并发最少 + 轮询」负载均衡。
-3. **配置 model / `auto`**：回退到 `config.yaml` 的 `models` 声明；`auto` 表示在全部在线实例中择优。
+与标准 OpenAI 接口一致（鉴权见 §7）。关键规则：
 
-> ⚠️ **tag 不要被截断**：`model: "chatgpt-web-3"` 会与实例上报的 `tag=chatgpt-web-3` 精确匹配。前提是 Options 里该标签页的「Instance / 路由 Tag」填的是 `chatgpt-web-3` 并已保存。
+- `model` 合法性（`validModel`）：
+  1. 等于某个在线实例的 `instance_id` → 精确路由到该实例；
+  2. 等于某个在线实例的 `tag` → 路由到该 tag 分组；
+  3. 等于 `config.models` 中某个 `id` → 配置回退（无在线实例时仍可用）；
+  4. 等于特殊关键字 `auto` → 由中继在所有在线实例中择优。
+- `messages`：`[{role, content}]`，必需。
+- `stream`：`true` 时返回 SSE 增量流；`false` 时返回完整 JSON。
+- `temperature` / `max_tokens` 等透传，但中继不强制在网页侧使用。
 
-`instance_id` 由插件自动生成并**持久化**（按浏览器 profile 固定前缀 + 标签页 id 后缀），service worker 重启后保持稳定，`/models` 与 `/healthz` 计数不会抖动。
+**错误码**
 
----
+| HTTP | 场景 |
+|------|------|
+| `400` | `model` 为空 / 不支持（`validModel` 不通过） / 请求体非法 |
+| `401` | 未带或错误 `auth_token` |
+| `503` | 没有可承接该 `model` 的在线实例；或该实例**排队已满**（系统繁忙） |
+| `502` | 任务已下发但 WS 发送失败 |
+| `500` | 非流式任务在等待中被取消 |
 
-## 6. 流式回传链路（核心）
+> 超时（`config.yaml` 中 `task_timeout` 配置，默认 120s）不会返回 HTTP 504，而是以 SSE `error` 事件结束流式响应。
+> 排队已满时返回 `503`，响应体：`{"error":"系统繁忙，请稍后再试（服务器并发已达上限）"}`。
 
-这是本项目最易踩坑的部分。两种模式、两条脚本世界，回传路径不同。
+响应（非流式）示例：
 
-### 6.1 隔离世界通道（`bridge.js`）
-
-`bridge.js` 由 content script 注入（manifest 自动注入 + 动态 `executeScript`），运行在**隔离世界**，可拦截页面 `fetch` 流式：
-
-```
-页面 fetch 响应 (SSE 流)
-   └─ bridge.js 拦截 → 按 chatApi/sseField 解析 delta
-        └─ chrome.runtime.sendMessage({ type:'bridge.delta'/'bridge.done' })
-             └─ background.js → 转发给 popup(手动) 或 WS(接口驱动)
-```
-
-### 6.2 主世界通道（`pageBridge.js`）
-
-`pageBridge.js` 由 popup/background 以 `world: 'MAIN'` 注入到**主世界**，直接 hook 页面真实 `fetch` / `XMLHttpRequest` / `EventSource`：
-
-```
-页面真实请求响应
-   └─ pageBridge.js hook (fetch / xhr / eventsource 三路之一)
-        └─ window.postMessage({ __pageBridge:'delta'/'done', content })
-             └─ content.js 监听 __pageBridge 消息
-                  └─ chrome.runtime.sendMessage({ type:'task.delta'/'task.done', task_id })
-                       └─ background.js → popup(手动) 或 WS(接口驱动)
+```json
+{
+  "id": "chatcmpl-task-...",
+  "object": "chat.completion",
+  "model": "chatgpt",
+  "choices": [
+    { "index": 0, "message": { "role": "assistant", "content": "..." },
+      "finish_reason": "stop" }
+  ]
+}
 ```
 
-> **何时走哪条通道**：`bridge.js`（隔离世界）只能看到跨世界可见的 fetch 调用；部分站点真实请求发生在主世界、隔离世界拦截不到，此时由 `pageBridge.js`（主世界）兜底。两者都配置好后，**命中任一即可回传**，互不冲突。
-
-### 6.3 控制台来源标签
-
-`pageBridge.js` 打印日志已带来源标签，便于排查到底哪条通道在工作：
+SSE（流式）逐片：
 
 ```
-[pageBridge:fetch]        # 来自 fetch 流式 ReadableStream
-[pageBridge:xhr]          # 来自 XMLHttpRequest 轮询 responseText 增量
-[pageBridge:eventsource]  # 来自原生 EventSource
+data: {"choices":[{"delta":{"role":"assistant","content":"你"},"finish_reason":null}]}
+data: {"choices":[{"delta":{"content":"好"},"finish_reason":null}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+data: [DONE]
 ```
 
-若确认某站点走的是哪一路，可据此判断是否需要调整 `chatApi` 配置或启用主世界 hook。
+### 6.2 `GET /v1/models`
 
-### 6.4 兜底通道（MutationObserver）
+返回在线实例的模型列表：
+- **每个在线实例一条**：`id` = 该实例的 `instance_id`，`owned_by` = 实例 `tag`（供「按实例精确路由」）；
+- **同 `tag` 多实例时**，额外追加一条 `id = tag` 的聚合入口（供该 tag 内负载均衡）；
+- 无在线实例时，回退到 `config.models` 中声明的列表（避免下拉框空白，便于排障）。
 
-当 CSP 禁止 fetch 拦截、且主世界 hook 也未命中时，`content.js` 用 `MutationObserver` 监听回答区节点，按「差异选择器」回传新增文本。此通道首字延迟略高且无法精确取消。
-
----
-
-## 7. 端到端时序（一轮对话）
-
-1. 客户端 `POST /v1/chat/completions` → 后端按 `model` 路由到目标实例，创建任务并 `Dispatch`。
-2. 后端经 WS 下发 `task.create` 给插件 `background.js`。
-3. 插件确保目标 tab 的 content/bridge 脚本已注入，注入 `__relayTaskId` 全局变量，并把配置写入主世界 `localStorage.__relayCfg`（供 pageBridge 读取），再以 `world:'MAIN'` 注入 `pageBridge.js`；然后向 content script 发 `task.run`（含 prompt / 选择器 / 是否流式 / chatApi / sseField）。
-4. content.js 把 prompt 填入输入框、点击发送；`bridge.js`（隔离世界）与 `pageBridge.js`（主世界）分别尝试拦截流式，逐块回传 `delta`。
-5. 后端以 OpenAI SSE 格式把 chunk 透传给客户端；120s 内无完成事件则任务超时失败。
-6. 网页回答结束，插件发 `task.done`，后端标记成功并关闭 SSE 流。
-7. 兜底：上述拦截通道均失效时，`content.js` 用 `MutationObserver` 监听回答区节点回传新增文本。
-
----
-
-## 8. 插件 Options 配置（每标签页独立）
-
-| 配置项 | 说明 |
-| --- | --- |
-| 启用 | 是否监听该标签页并连接网关（关闭则断开该实例） |
-| WS URL | 后端地址，如 `ws://127.0.0.1:8191/ws`（公网用 `wss://`） |
-| Token | 与后端 `auth_token` 一致 |
-| Instance / 路由 Tag | 路由分组键（如 `chatgpt`、`chatgpt-web-3`）。**调用时 `model` 填此值即可路由到该 tag 下实例** |
-| 支持的模型 | 该实例声明的模型名列表（逗号分隔，用于 `/v1/models` 展示） |
-| 输入框选择器 / 发送按钮选择器 | 网页模型输入框 / 发送按钮的 CSS 或 XPath |
-| 对话接口路径 / SSE 字段映射 | bridge / pageBridge 拦截匹配与字段解析（含 `reasoning_content` 思考链支持） |
-| 平台预设 | 内置 `openai` / `stepfun` / `claude` 三套选择器与字段映射，一键填入 |
-
-> 每个标签页一套配置、一条独立 WS 连接。新增标签页时从「当前已打开的浏览器标签」中挑选并保存。
-
----
-
-## 9. 加载与配置插件
-
-1. Chrome 打开 `chrome://extensions`，开启「开发者模式」。
-2. 点击「加载已解压的扩展程序」，选择 **`extension/`** 目录（不是 `extension - 副本/`）。
-3. 点击插件图标 → 「选项」，对每个要使用的标签页：
-   - 勾选「启用」
-   - Gateway WS URL：`ws://127.0.0.1:8191/ws`（公网用 `wss://`）
-   - Access Token：与后端 `auth_token` 一致（默认 `sk-demo-token`）
-   - Instance Tag：`chatgpt` / `claude` / `chatgpt-web-3` 等
-   - 输入框 / 发送按钮 CSS 选择器（可先用「平台预设」一键填入）
-   - 点「保存全部」
-4. 打开对应网页版模型并保持登录。
-5. 浏览器控制台执行 `chrome.storage.local.get(['targetTabs'])` 确认配置已写入（每个启用标签页 `enabled:true`、正确 `tag`/`models`）。
-
-> 🔁 **每次修改扩展 JS 文件后，必须在 `chrome://extensions` 点「重新加载」(↻) 按钮**，否则浏览器仍在运行旧内存代码，改动不生效。
-
----
-
-## 10. 两种使用模式
-
-### 10.1 手动模式（Popup 驱动，无需后端）
-
-在插件 Popup 中选择目标标签页 → 输入内容 → 发送 → 插件直接填入网页并捕获流式输出在弹窗内展示。完全本地，不经由 Golang 后端。
-
-Popup 还提供：
-- **实例连接状态面板**：实时显示各标签页是否在线、`instance_id`、`tag`；
-- **元素探测开关**：开启后在控制台打印点击/输入元素的 CSS 选择器与 XPath，便于配置选择器。
-
-**二次对话说明（已修复）**：手动模式下，`content.js` 维护一个任务上下文 `cur`。第一次对话完成后由 `task.finished` 消息（popup 收到 `task.done`/`task.error` 时下发）清空 `cur`；并设有 120s 超时兜底。因此**连续多次对话都能正常触发选择器发送**，不会被「上一次未清空」拦截。
-
-### 10.2 接口驱动模式（后端 + 插件协同）
-
-```bash
-curl -N -H "Authorization: Bearer sk-demo-token" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"chatgpt","stream":true,"messages":[{"role":"user","content":"用一句话解释量子纠缠"}]}' \
-  http://127.0.0.1:8191/v1/chat/completions
+```json
+{ "object": "list", "data": [
+  { "id": "inst-xxxx", "object": "model", "owned_by": "chatgpt" },
+  { "id": "chatgpt",   "object": "model", "owned_by": "chatgpt" }
+] }
 ```
 
-后端经 WS 下发任务给插件 → 插件驱动**已配置的目标标签页**的网页 → delta 以 SSE 经 WS 上行 → 后端原样透传 OpenAI SSE。
+### 6.3 `POST /v1/chat/cancel`
 
-- 精确路由某标签页：`model` 填 `inst-<前缀>-<tabId>`（从 `/v1/models` 或 Popup 连接状态面板获取）。
-- 按 tag 负载均衡：`model` 填 `chatgpt-web-3`（某实例上报的 tag）。
-
----
-
-## 11. 测试
-
-### 11.1 内置测试网页
-
-启动 `main.exe` 后，浏览器打开 `http://127.0.0.1:8191/`，使用内置「网关对接测试台」：
-
-1. **健康检查**：确认后端存活及**已连接的网页插件实例数**（实例为 0 时对话返回 503）。
-2. **模型列表**：拉取在线实例列表（`/v1/models`）。
-3. **对话测试**：发一条对话，流式逐字显示 SSE 回传（需插件在线且保持对应网页登录）。
-4. **取消任务**：流式进行中调用 `/v1/chat/cancel` 并向插件下发 `task.cancel` 中断网页请求。
-
-页面为自包含单文件（`web/test.html`），连接地址 / 前缀 / Token 可在页面上临时修改，无需重新编译。
-
-### 11.2 模拟插件（无需浏览器）
-
-```powershell
-go build -o simws.exe ./cmd/simws
-# 先启动 main.exe，再启动 simws.exe，然后 curl 调用即可看到 SSE 透传
+```json
+{ "task_id": "uuid" }
 ```
 
----
+取消进行中的任务（客户端主动中断流式读取时通常由 SDK 自动触发）。中继向插件实例下发 `task.cancel`，由插件侧 `AbortController.abort()` 中断页面请求。返回 `{ "status": "cancelled", "task_id": "..." }` 或错误。
 
-## 12. 内部协议（WebSocket JSON）
+> `/v1/chat/cancel` 同样受 `auth_token` 保护（与 `chat/completions` 同源鉴权）。
 
-实例注册由 **WS 连接 query 参数**自动完成（`?instance_id=&tag=&models=&token=`），无需单独的 `register` 消息。心跳通过前端 `ping` 帧推进 `LastPing`。
+### 6.4 `GET /healthz`
 
-```
-插件(主世界/隔离) → 后端:
-  task.ack     {type, task_id}                          // 任务被插件接收并已在网页执行
-  task.delta   {type, task_id, choices, finish_reason}  // 流式增量（bridge 通道）
-  task.done    {type, task_id, content, finish_reason}  // 网页回答完成（终态）
-  task.error   {type, task_id, message}                 // 执行错误
-  task.status  {type, task_id, status, message}         // 状态变更（可选）
+无需鉴权。返回在线实例数与实例明细：
 
-后端 → 插件(background.js):
-  task.create  {type, task_id, model, messages, stream, temperature}  // 下发任务
-  task.cancel  {type, task_id}                              // 取消指令
-
-插件内部（background.js → content.js）:
-  task.run       {type, task_id, prompt, inputSelector, sendSelector, chatApi, sseField}
-  task.cancel    {type, task_id}
-  task.finished  {type, task_id}   // 手动模式对话结束后由 popup 下发，通知 content 清空 cur
-
-页面主世界 → content.js (window.postMessage):
-  __pageBridge   {__pageBridge:'delta'|'done', content}   // pageBridge 主世界抓取后回传
+```json
+{ "status": "ok", "online_instances": 2,
+  "instances": [ { "instance_id": "...", "tag": "chatgpt", "models": "chatgpt", "online": true, "tasks": 0 } ] }
 ```
 
-错误码约定（后端 → 客户端 HTTP）：
+### 6.5 `GET /` 与 `GET /test`
 
-| code | 含义 |
-|---|---|
-| 400 | 请求体解析失败 / 缺 messages |
-| 401 | Token 缺失或错误（HTTP Bearer 或 WS `?token=`） |
-| 404 | model 未知且无匹配 tag / instance_id |
-| 503 | 目标 tag / 实例无在线实例 |
-| 504 | 任务超时（120s） |
+内置调试页（`web/test.html`），用于手动构造 `chat/completions` 请求并观察 SSE 输出。
 
----
+### 6.6 单实例串行与排队控制
 
-## 13. 可靠性与已知限制
+这是本系统的核心并发约束：**每个 WS 实例（即一个浏览器标签页）同一时刻只允许 1 个客户端在网页上操作**，避免多个对话在同一页面上交叉、互相污染。
 
-- **断线重连**：`background.js` 采用指数退避（初次 1s，上限 30s）重连；配置存于 `chrome.storage.local`，重连后自动重新注册。
-- **instance_id 稳定**：前缀持久化于 storage，service worker 重启后不变化，避免路由 key 抖动。
-- **负载均衡**：同 tag 下选择「当前并发任务最少」的实例，任务数相同时轮询（round-robin）。
-- **并发控制**：单实例串行执行，后端对实例标记 `busy`，新任务排队或路由到其他实例。
-- **已知限制**：
-  - 拦截式流式依赖页面 `fetch`，站点强 CSP（`connect-src` 白名单）时会回退到 `MutationObserver` 兜底。
-  - 网页改版（选择器 / SSE 结构变化）需同步更新 Options 配置或平台预设。
-  - 手动模式下单标签页同一时刻只能处理一个任务（二次对话可顺序触发，已被 `cur` 接管逻辑修复）。
+- **串行执行**：实例内部维护一个 FIFO 队列，`serve()` 协程每次只把队首任务通过 `task.create` 下发给插件；该任务 `done` 后才处理下一个。
+- **可配置排队**：`config.yaml` 的 `concurrency.max_queue` 控制「除正在执行的 1 个外，还能排队多少个」。默认 `3`（即 1 执行 + 3 等待）。
+  - `max_queue: 0` → 严格串行，第 2 个并发请求立即被拒（最严格，适合单账号防风控）。
+  - `max_queue: N` → 允许 N 个请求挂起等待，对客户端表现为「稍等片刻」。
+- **排队满拒绝**：当某实例队列已达 `max_queue`，新请求入队时返回 `503`，响应体 `{"error":"系统繁忙，请稍后再试（服务器并发已达上限）"}`，**不会卡住连接**。
+- **多实例并行**：同一 `tag` 下若有多个插件实例在线，网关按「队列最短」择优路由，各实例各自串行、彼此并行，从而横向扩展吞吐。
+- **不丢任务**：排队的 HTTP 连接保持打开（SSE 挂起），前面任务结束后自动被调度执行；任务自身 `task_timeout`（默认 120s）超时保护同样覆盖排队阶段，不会死锁。
+
+> 实现位置：`internal/ws/client.go`（`queue` + `serve()`）、`internal/ws/hub.go`（`Enqueue` / `ErrBusy`）、`internal/http/router.go`（`ChatCompletions` 入队与 503 处理）、`internal/config/config.go`（`Concurrency`）。
 
 ---
 
-## 14. 常见问题排查（Troubleshooting）
+## 7. 鉴权
 
-### Q1. 派发时报 "A listener indicated an asynchronous response by returning true..."
-原因：`onMessage` 监听器 `return true` 声明异步响应却从不调用 `sendResponse`。已修复——所有不需要回响应的分支（task.run / task.cancel / picker.toggle）改为 `return`（不再 `return true`），`selector.test` 等确需响应的保留 `return true + sendResponse`。popup 派发端改用显式回调并忽略"端口关闭"类无害告警。
+`auth_token` 非空时：
 
-### Q2. 控制台有 `[pageBridge:xxx]` 打印，但内容没回传到 WS / 弹窗
-说明 pageBridge 主世界已抓到数据，但回传链断在中间。检查：
-- `pageBridge` 是否被正确注入（`world:'MAIN'`）—— 加载目录必须是 `extension/`；
-- `content.js` 是否监听 `__pageBridge` 消息并转发 `task.delta`（已修复）；
-- 手动模式下是否有 `cur` 上下文（需先经 `task.run` 启动任务，`cur` 才有 `task_id`）；
-- 主世界配置 `localStorage.__relayCfg` 是否含正确的 `chatApi`。
-
-### Q3. 手动模式第二次发不出（点了发送只显示「正在派发」但不操作输入框）
-原因：第一次对话后 `cur` 残留，`task.run` 被 `if (cur) return` 拦截（已修复）。现在不同 `task_id` 的新对话可接管，且 `task.finished` + 120s 超时双兜底清理 `cur`。
-
-### Q4. 改完代码不生效
-必须在 `chrome://extensions` 点「重新加载」扩展，并确认加载的是 `extension/` 目录。
+- 所有 `/v1/*` 接口需带 `Authorization: Bearer <token>`（缺失/错误返回 `401`）；
+- WebSocket `/ws` 连接需在 query 带 `?token=<token>`（`wsToken` 非空时强制校验，失败直接关闭连接）；
+- 调试页 `web/test.html` 与插件 Options 都让你填 `auth_token`，需与中继一致。
 
 ---
 
-## 15. 安全提示
+## 8. 实例注册与心跳
 
-- 公网部署强制 `wss://` + HTTPS；本机/内网可用 `ws://`。
-- 网关 WS 注册强制校验 `token`（与 `auth_token` 一致），非法/伪造实例无法注册，不出现在 `/models`、`/healthz`。
-- 网页登录凭据仅存浏览器本地，后端与插件均不上传。
-- 仅限个人 / 企业内部自用 / 研究用途。
+插件连接 `ws://<host>/ws?instance_id=...&tag=...&models=...&token=...` 后：
+
+- 服务端从 query 自动注册（`instance_id` 为空则不注册，仅保持连接）；
+- 也可发送 `instance.register` 消息体（`{instance_id, tag, models}`）进行显式注册；
+- 注册成功回 `register.ack`；
+- 服务端周期（约 30s）发 `ping`，插件回 `pong`，`LastPing` 用于存活判断。
+
+> 说明：`config.yaml` 当前没有 `allowed_tags` 白名单机制；任何能带正确 `token` 的实例均可注册。
 
 ---
 
-## 16. 阶段规划
+## 9. 任务编排与状态机
 
-| 阶段 | 范围 | 状态 |
-|---|---|---|
-| 第一阶段 | 手动模式 + 端到端打通（单实例、单标签） | ✅ 已实现 |
-| 第二阶段 | 接口驱动 + 多实例聚合 + 负载均衡 + 取消 | ✅ 已实现核心链路 |
-| 第三阶段（规划） | 全自动接管：插件监听页面 fetch 自动识别网页模型并注册，免手动绑标签页；可视化实例池管理后台 | ⬜ 待定 |
-| 第四阶段（规划） | 思考链（`reasoning_content`）单独 SSE 字段透传标准化；多 tag 并行扇出；失败自动重试路由 | ⬜ 待定 |
+```
+created ──▶ running ──▶ done(finish_reason=stop)
+   │
+   ├──▶ cancelled(finish_reason=cancelled / HTTP 500)
+   └──▶ timeout(task_timeout 默认 120s, SSE error 事件)
+```
+
+- 中继收到 `/v1/chat/completions` → 生成 `task_id`（形如 `task-<日期>-<随机>`）→ 选实例 → 下发 `task.create`；
+- 插件回 `task.ack`（可选）→ 周期性回 `task.delta`（增量文本，已是完整 SSE 文本原样透传）→ 回 `task.done`（含 `finish_reason`）；
+- 出错回 `task.error`（`code` + `message`）；
+- 中继按 `task_id` 把增量拼成 SSE 推给上层；
+- 超时或 `max_rounds` 触顶 → 强制结束（SSE error）；
+- 取消：客户端调 `/v1/chat/cancel` → 中继下发 `task.cancel` → 插件中断页面请求。
+
+**`task.create` 下行数据（中继 → 插件）**
+
+协议字段（`internal/ws/protocol.go` 的 `TaskCreateData`）包含：
+
+```json
+{ "type": "task.create",
+  "task_id": "uuid",
+  "data": {
+    "model": "chatgpt",
+    "messages": [{"role":"user","content":"hi"}],
+    "stream": true,
+    "selector": "",
+    "send_button_selector": "",
+    "answer_selector": ""
+  } }
+```
+
+> 注意：中继当前**只填充** `model` / `messages` / `stream` 三个字段；`selector` / `send_button_selector` / `answer_selector` 字段保留在协议中但由**插件侧**在 `task.run` 派发时从「站点卡片配置」注入。元素定位完全在插件侧完成，中继只负责路由与文本回传。
+
+---
+
+## 10. 字段映射规则（插件侧为主）
+
+插件「站点卡片」支持两类字段映射，用于把网页 DOM 文本抽取成结构化消息：
+
+**A. 简单映射（数组，按 selector 顺序）**
+
+```json
+{ "selector": ".user-msg", "field": "user", "type": "text" }
+{ "selector": ".bot-msg",  "field": "bot",  "type": "text" }
+```
+
+**B. 条件映射（对象，带 `when` 判定，避免页面多区域误匹配）**
+
+```json
+{ "when": { "selector": ".role-label", "text": "我" },
+  "then": { "selector": ".content", "field": "user", "type": "text" } }
+```
+
+支持的 `type`：`text` / `json` / `raw` / `map`。
+
+> 早期设计曾把「字段映射」描述为后端 `config.yaml` 的全局 `field_mapping`，但当前 `Config` 结构**不含该字段**，字段映射完全在插件 Options 卡片里配置。以插件侧配置为准。
+
+---
+
+## 11. 插件内部结构
+
+| 文件 | 职责 |
+|------|------|
+| `background.js` | WS 客户端、任务路由、`instance.register`/`task.*` 收发、心跳保活、多实例重连 |
+| `content.js` | 注入目标页；转发插件↔页面消息；暴露选择器工具 |
+| `pageBridge.js` | **主世界（Main World）** 脚本：直接操作页面 DOM、轮询/监听回答、抓取最终文本 |
+| `bridge.js` | content ↔ background 的桥接通道 |
+| `popup.js` | 弹窗：显示服务地址、连接状态、快速开关 |
+| `options.js` | 选项页：增删站点卡片（URL/选择器/字段映射/手动对话开关）；内置 `stepfun` 预设 |
+| `manifest.json` | 扩展清单（权限、content_scripts、background service worker） |
+| `popup.html` / `options.html` / `style.css` | 界面 |
+
+### 11.1 两种对话模式
+
+- **自动模式**（默认）：插件自动填表、点发送、监听回答、回传。
+- **手动对话模式**：开启后插件只负责抓取「已存在对话」的最终回答，不自动发送。适合需要人工介入或规避风控的场景。
+
+### 11.2 调试
+
+- 中继侧：`debug: true` 会打印所有 WS 收发报文（含截断的长文本）；
+- 插件侧：Options 页「调试开关」开启后，控制台输出任务生命周期与 DOM 抓取详情；
+- 调试页 `web/test.html` 可手动构造 `chat/completions` 请求、观察返回。
+
+---
+
+## 12. `selectorjs` 辅助脚本
+
+根目录的 `selectorjs`（无扩展名）是一个**独立的浏览器控制台小工具**，用途：在目标聊天网页的开发者控制台里运行它，点击页面元素后自动打印该元素的 CSS 选择器，便于你在插件 Options 卡片里填写 `selector` / `send_button_selector` / `answer_selector`。
+
+使用方式（两种之一）：
+
+1. 直接把 `selectorjs` 文件内容粘贴到浏览器控制台执行；
+2. 或把它当作书签脚本（bookmarklet）保存，打开网页后点击该书签激活「点击取选择器」模式。
+
+激活后：鼠标悬停/点击任意元素，控制台即输出类似 `body > div.app > div.main > textarea#prompt` 的选择器字符串，复制填入插件配置即可。
+
+---
+
+## 13. 运维与排错
+
+| 现象 | 可能原因 | 处理 |
+|------|----------|------|
+| 请求返回 `400 unsupported model` | `model` 无匹配实例 / 未注册 / 非 `auto` | 检查插件是否已连接并注册；`/v1/models` 或 `/healthz` 看实例 |
+| 请求返回 `503` | 无在线实例 / 实例排队已满（系统繁忙） | 检查插件 WS 是否连上、token 是否正确；多 agent 并发时调大 `concurrency.max_queue` 或增开同 `tag` 实例 |
+| 流式只收到一部分就断 | 实例心跳超时被判离线 | 检查浏览器是否休眠回收 SW；开 `debug` 看报文 |
+| 抓取到的回答为空/错乱 | 选择器/字段映射不准 | 用 `selectorjs` 重新取选择器；开调试模式看 DOM |
+| 全部实例都接单失败 | 目标网页改版 / 登录失效 | 插件侧处理，中继只透传 `task.error` |
+
+---
+
+## 14. 安全提示
+
+- `auth_token` 仅用于上层↔中继的接口鉴权以及 `/ws` 注册校验，**不加密** WebSocket 本身；生产环境请在 `localhost` 或反代（HTTPS + Basic/Bearer）后使用。
+- 插件以你的登录态操作目标网页，等同于「你在网页上聊天」；请勿把中继暴露到不可信网络。
+- 当前 `Config` 无 `allowed_tags` 白名单，任何持正确 token 的实例均可注册，请通过 token 与网络隔离控制接入范围。
+
+---
+
+## 15. 相关文档
+
+- `PRD.md`：产品需求文档（目标用户、使用场景、验收标准），已与当前代码实现对齐。

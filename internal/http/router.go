@@ -199,14 +199,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taskID := "task-" + time.Now().Format("20060102") + "-" + randString(6)
-	client := h.hub.Dispatch(req.Model, taskID)
-	if client == nil {
-		http.Error(w, `{"error":"no available instance for model `+req.Model+`"}`, http.StatusServiceUnavailable)
-		return
-	}
-	defer h.hub.Release(client.InstanceID)
-
-	t := h.taskMgr.Create(taskID, req.Model, client.InstanceID)
 
 	msgs := make([]ws.WSMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
@@ -218,12 +210,23 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream:   req.Stream,
 	}
 	env := &ws.Envelope{Type: ws.TypeTaskCreate, TaskID: taskID, Data: mustRaw(taskData)}
-	if err := client.Send(env); err != nil {
-		h.taskMgr.Fail(taskID, "SEND_FAILED", err.Error())
-		http.Error(w, `{"error":"failed to dispatch task to instance"}`, http.StatusBadGateway)
+
+	t := h.taskMgr.Create(taskID, req.Model, "")
+	// 入队：选择实例并排入其串行队列；队列满则返回 ErrBusy（系统繁忙）
+	client, err := h.hub.Enqueue(req.Model, taskID, t, env)
+	if err != nil {
+		h.taskMgr.Fail(taskID, "ENQUEUE_FAILED", err.Error())
+		if err == ws.ErrBusy {
+			http.Error(w, `{"error":"系统繁忙，请稍后再试（服务器并发已达上限）"}`, http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, `{"error":"no available instance for model `+req.Model+`"}`, http.StatusServiceUnavailable)
+		}
 		return
 	}
-	log.Printf("[chat] dispatched task=%s model=%s instance=%s stream=%v", taskID, req.Model, client.InstanceID, req.Stream)
+	t.InstanceID = client.InstanceID
+	defer h.hub.Release(client.InstanceID)
+
+	log.Printf("[chat] enqueued task=%s model=%s instance=%s stream=%v", taskID, req.Model, client.InstanceID, req.Stream)
 
 	if req.Stream {
 		h.streamResponse(w, r, t, req.Model, taskID)

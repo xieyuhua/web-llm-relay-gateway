@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -22,11 +23,13 @@ type Hub struct {
 	upgrader websocket.Upgrader
 	wsToken  string // 插件注册所需的 Access Token（与 /v1 的 auth_token 一致）
 	debug    bool   // debug 模式：打印客户端连接信息与会话收发原文
+	maxQueue int    // 每个实例允许排队的最大请求数（不含正在执行的 1 个）
 }
 
 // NewHub 创建 Hub。wsToken 为插件 WebSocket 注册校验令牌，空字符串表示不校验（不推荐）。
 // debug 为 true 时打印客户端连接信息与会话收发原文（含 token 脱敏）。
-func NewHub(taskMgr *task.Manager, wsToken string, debug bool) *Hub {
+// maxQueue 为每个实例允许排队等待的最大请求数（不含正在执行的 1 个）。
+func NewHub(taskMgr *task.Manager, wsToken string, debug bool, maxQueue int) *Hub {
 	return &Hub{
 		clients: make(map[string]*Client),
 		byTag:   make(map[string][]*Client),
@@ -34,11 +37,15 @@ func NewHub(taskMgr *task.Manager, wsToken string, debug bool) *Hub {
 		taskMgr: taskMgr,
 		wsToken: wsToken,
 		debug:   debug,
+		maxQueue: maxQueue,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
 }
+
+// ErrBusy 表示实例排队已满，拒绝新请求（HTTP 侧返回 503 系统繁忙）。
+var ErrBusy = errors.New("instance busy: queue full")
 
 // debugf 仅在 debug 模式打印。
 func (h *Hub) debugf(format string, args ...interface{}) {
@@ -90,7 +97,7 @@ func (h *Hub) unregister(instanceID string) {
 	log.Printf("[hub] instance %s unregistered", instanceID)
 }
 
-// RouteTo 按 model 路由：
+// RouteTo 按 model 路由（对外公开版本，内部加锁）。
 //   - 若 model 直接匹配某个在线实例的 instance_id，则精确路由到该实例（按实例精确选择）。
 //   - 否则 model 前缀匹配 tag（如 chatgpt-web -> chatgpt），在 tag 下所有在线实例中
 //     选择「并发任务数最少」的实例；若并发相同则按轮询游标打散（负载均衡）。
@@ -98,14 +105,13 @@ func (h *Hub) unregister(instanceID string) {
 //
 // 返回在线实例；无可用实例返回 nil。
 func (h *Hub) RouteTo(model string) *Client {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.routeToLocked(model)
+}
 
-	// 精确实例路由：model 即为 instance_id
-	if c, ok := h.clients[model]; ok && c.Online {
-		return c
-	}
-
+// routeToLocked 按 model 路由（调用方需持有 h.mu）。
+func (h *Hub) routeToLocked(model string) *Client {
 	tag := h.modelTag(model)
 
 	pick := func(list []*Client) *Client {
@@ -143,23 +149,36 @@ func (h *Hub) RouteTo(model string) *Client {
 }
 
 // Dispatch 路由到实例并增加其并发计数，返回所选实例（nil 表示无可用）。
+// 注意：当前已改为基于实例内串行队列（见 Enqueue），Dispatch 仅做路由选择，
+// 不再直接递增并发计数；保留以便兼容旧调用点。
 func (h *Hub) Dispatch(model, taskID string) *Client {
-	c := h.RouteTo(model)
-	if c == nil {
-		return nil
-	}
-	c.incrTasks()
-	return c
+	return h.RouteTo(model)
 }
 
-// Release 任务结束时减少实例并发计数。
-func (h *Hub) Release(instanceID string) {
+// Enqueue 将任务排入目标实例的串行执行队列。
+// 语义：每个 WS 实例同一时刻只允许 1 个客户端在网页上操作；其余请求进入该实例
+// 的等待队列（容量 = maxQueue）。队列已满则直接返回 ErrBusy，由 HTTP 层返回 503 系统繁忙。
+//
+// 入队成功后立即返回（task.create 由实例的 serve 协程按 FIFO 顺序真正下发），
+// 调用方（HTTP handler）随即开始阻塞读取任务的 SSE 流，等前面任务跑完即被调度。
+func (h *Hub) Enqueue(model, taskID string, task *task.Task, taskData *Envelope) (*Client, error) {
 	h.mu.RLock()
-	c, ok := h.clients[instanceID]
+	c := h.routeToLocked(model)
 	h.mu.RUnlock()
-	if ok {
-		c.decrTasks()
+	if c == nil {
+		return nil, errors.New("no available instance for model " + model)
 	}
+	// 容量检查：队列中已等待的数量 + 正在执行的 1 个 ≤ maxQueue + 1
+	if len(c.queue) >= h.maxQueue {
+		return nil, ErrBusy
+	}
+	c.queue <- &pendingTask{taskID: taskID, task: task, env: taskData}
+	return c, nil
+}
+
+// Release 任务结束时的清理钩子（当前串行队列下为兼容保留，无实际操作）。
+func (h *Hub) Release(instanceID string) {
+	// 串行队列由 serve 协程自行调度，无需在此递减计数。
 }
 
 // SendTo 向指定实例下发消息（如 task.cancel）。
