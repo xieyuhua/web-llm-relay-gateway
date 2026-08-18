@@ -164,48 +164,100 @@
     return true;
   }
 
-  function runTask() {
-    // 本 frame 未匹配到输入框：若自己是顶层 frame 则报错（多半是选择器配错）；
-    // 若是子 frame 则静默忽略（输入框可能在别的 frame 中），避免重复误报。
+  // 等待直到回调返回 true，或超时（避免死等）。返回 true 表示条件满足。
+  function waitUntil(cond, timeoutMs, intervalMs) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const tick = () => {
+        let ok = false;
+        try { ok = cond(); } catch (e) { ok = false; }
+        if (ok) return resolve(true);
+        if (Date.now() - start >= timeoutMs) return resolve(false);
+        setTimeout(tick, intervalMs);
+      };
+      tick();
+    });
+  }
+
+  // ---------- 阶段一：写入输入框并「确认完成」 ----------
+  // 返回 true 表示输入已成功写入；false 表示失败（已上报错误）。
+  async function fillInput() {
     let r = resolve(cur.inputSelector, true);
     if (r.error) {
       if (window === window.top) {
         reportError('NO_INPUT', r.error + '，请在 Options 中为该标签页正确配置输入框选择器');
       }
       cur = null;
-      return;
+      return false;
     }
     const input = r.node;
     try {
       setText(input, cur.prompt);
     } catch (e) {
       reportError('SET_TEXT_FAILED', '写入输入框失败: ' + e.message);
-      return;
+      return false;
     }
+    // 等待输入框内容真正落定（部分站点用 React 受控组件，需等其 state 同步），
+    // 同时确认元素未被卸载。最多等 3s，避免阻塞。
+    await waitUntil(() => {
+      const cur2 = resolve(cur.inputSelector, true);
+      if (!cur2.node) return false;
+      const v = cur2.node.value;
+      if (typeof v === 'string') return v === cur.prompt || v.length >= cur.prompt.length;
+      return cur2.node.textContent === cur.prompt || (cur2.node.textContent || '').includes(cur.prompt);
+    }, 3000, 100);
+    return true;
+  }
 
+  // ---------- 阶段二：发送（必须在输入框写入完成后才执行） ----------
+  async function doSend() {
+    const input = resolve(cur.inputSelector, true).node;
     // 发送：优先用 sendSelector；否则回车提交
     if (cur.sendSelector) {
+      // 先等待发送按钮变得可点（站点常需输入框内容就绪后才启用/渲染发送按钮）
+      const ready = await waitUntil(() => {
+        const sr = resolve(cur.sendSelector, false);
+        if (sr.error || !sr.all.length) return false;
+        return !!sr.all.find(isClickable);
+      }, 5000, 150);
       const sr = resolve(cur.sendSelector, false);
       if (!sr.error && sr.all.length) {
         let btn = sr.all.find(isClickable) || sr.all[0];
         const res = clickSend(btn);
         if (res === 'disabled') {
-          setTimeout(() => {
+          // 仍不可用：再补等一轮后重试（站点的发送按钮可能在输入后才可用）
+          await waitUntil(() => {
+            const sr2 = resolve(cur.sendSelector, false);
+            return !!(sr2.all && sr2.all.find(isClickable));
+          }, 8000, 200).then(() => {
             if (!cur) return;
             const sr2 = resolve(cur.sendSelector, false);
             if (sr2.all && sr2.all.length) {
               const b = sr2.all.find(isClickable);
               if (b) clickSend(b);
             }
-          }, 800);
+          });
         }
         return;
       }
-      // sendSelector 未命中：回车提交
-      submitInput(input);
+      // sendSelector 未命中（即使等待后仍未出现）：回车提交兜底
+      if (input) submitInput(input);
     } else {
-      submitInput(input);
+      if (input) submitInput(input);
+      else submitInput(resolve(cur.inputSelector, true).node);
     }
+  }
+
+  async function runTask() {
+    // 本 frame 未匹配到输入框：若自己是顶层 frame 则报错（多半是选择器配错）；
+    // 若是子 frame 则静默忽略（输入框可能在别的 frame 中），避免重复误报。
+    // 阶段一：写入输入框，并等待其生效
+    const ok = await fillInput();
+    if (!ok) return; // fillInput 内部已上报错误 / 静默忽略
+    // 输入与发送之间固定间隔 1 秒，确保输入框内容被站点充分处理/识别
+    await new Promise((res) => setTimeout(res, 1000));
+    // 阶段二：输入框写入已完成后，再处理发送选择器（确保顺序执行）
+    await doSend();
   }
 
   function submitInput(input) {

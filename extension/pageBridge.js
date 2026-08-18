@@ -10,6 +10,7 @@
   let userPaths = null;
   let logPaths = null;
   let sseRule = null; // SSE 字段提取规则（JSON 对象）
+  let pbDebug = false; // 是否打印 [pageBridge:...] 控制台日志（由 popup 开关控制）
   function readStoredCfg() {
     try {
       const raw = window.localStorage.getItem('__relayCfg');
@@ -20,6 +21,7 @@
         if (o.sseField) {
           try { sseRule = JSON.parse(o.sseField); } catch (e) {}
         }
+        if (o.pageBridgeDebug != null) pbDebug = !!o.pageBridgeDebug;
       }
     } catch (e) {}
   }
@@ -29,6 +31,7 @@
     if (e.data.chatApi) userPaths = e.data.chatApi.split(',').map((x) => x.trim()).filter(Boolean);
     if (e.data.logPaths) logPaths = e.data.logPaths.split(',').map((x) => x.trim()).filter(Boolean);
     if (e.data.sseField) { try { sseRule = JSON.parse(e.data.sseField); } catch (err) {} }
+    if (e.data.pageBridgeDebug != null) pbDebug = !!e.data.pageBridgeDebug;
   });
 
   function getPaths() {
@@ -159,11 +162,11 @@
   function handleSseData(payload, source) {
     if (!payload || payload === '[DONE]') return;
     const content = extractContent(payload);
-    if (content) {
-      // 仅打印成功提取到的纯文本数据；source 标注来自 fetch / xhr / eventsource，便于排查
+    // 控制台日志受 popup 开关 pbDebug 控制（默认关闭，避免刷屏）
+    if (content && pbDebug) {
       console.log('[pageBridge:' + (source || '?') + ']', content);
     }
-    post('delta', content || payload);
+    if (content) post('delta', content);
   }
 
   function post(kind, content) {

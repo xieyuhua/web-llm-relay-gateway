@@ -266,6 +266,43 @@ async function applyPickMode(on) {
 }
 $('pickMode').addEventListener('change', (e) => applyPickMode(e.target.checked));
 
+// ---------- pageBridge 控制台日志开关 ----------
+// 持久化到 storage（pageBridgeDebug 作为真值源）。pageBridge.js（主世界）读取它来控制 [pageBridge:...] 打印。
+function setPbLogTip(on, tabId) {
+  const tip = $('pbLogTip');
+  if (!tip) return;
+  if (!on) { tip.textContent = '关闭'; tip.className = 'pick-tip'; return; }
+  tip.textContent = '开启 → 目标页控制台查看' + (tabId ? '（#' + tabId + '）' : '');
+  tip.className = 'pick-tip on';
+}
+// 把开关下发到目标标签页的主世界（pageBridge 在那里运行）
+async function pushPbLog(tabId, on) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: (v) => {
+        window.__relayPageBridgeDebug = v;
+        window.dispatchEvent(new MessageEvent('message', { data: { __pageBridgeCfg: true, pageBridgeDebug: v } }));
+        try {
+          const raw = window.localStorage.getItem('__relayCfg') || '{}';
+          const o = JSON.parse(raw);
+          o.pageBridgeDebug = v;
+          window.localStorage.setItem('__relayCfg', JSON.stringify(o));
+        } catch (e) {}
+      },
+      args: [on],
+    });
+  } catch {}
+}
+async function applyPbLog(on) {
+  await chrome.storage.local.set({ pageBridgeDebug: on });
+  const tabId = await autoMatchTab().catch(() => null);
+  if (tabId != null) await pushPbLog(tabId, on).catch(() => {});
+  setPbLogTip(on, tabId);
+}
+$('pbLog').addEventListener('change', (e) => applyPbLog(e.target.checked));
+
 // 初始化：读持久化状态并显示；若开启，则对当前目标标签页补发一次（popup 重新打开时恢复）
 (async () => {
   const o = await chrome.storage.local.get('pickMode');
@@ -274,4 +311,10 @@ $('pickMode').addEventListener('change', (e) => applyPickMode(e.target.checked))
   const tabId = await autoMatchTab().catch(() => null);
   if (on && tabId != null) await pushPickMode(tabId, true).catch(() => {});
   setPickTip(on, tabId);
+
+  const pb = await chrome.storage.local.get('pageBridgeDebug');
+  const pbon = !!pb.pageBridgeDebug;
+  $('pbLog').checked = pbon;
+  if (pbon && tabId != null) await pushPbLog(tabId, true).catch(() => {});
+  setPbLogTip(pbon, tabId);
 })();

@@ -213,44 +213,49 @@ function handleEnvelope(env, connTabId, connKey, connCfg, sendBack) {
         }).catch(() => {});
         chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['bridge.js'] }).catch(() => {});
         // 把配置写入【主世界】localStorage.__relayCfg，供 pageBridge.js（主世界）读取共享
-        chrome.scripting.executeScript({
-          target: { tabId, allFrames: true },
-          world: 'MAIN',
-          func: (chatApi, sseField, logPaths) => {
-            try {
-              const raw = window.localStorage.getItem('__relayCfg') || '{}';
-              const o = JSON.parse(raw);
-              if (chatApi) o.chatApi = chatApi;
-              if (sseField) o.sseField = sseField;
-              if (logPaths) o.logPaths = logPaths;
-              window.localStorage.setItem('__relayCfg', JSON.stringify(o));
-            } catch (e) {}
-          },
-          args: [ tabCfg.chatApi || '', tabCfg.sseField || '', tabCfg.logPaths || '' ],
-        }).catch(() => {});
-        // 注入【主世界】pageBridge.js：hook 页面真实 fetch/XHR/SSE，抓主世界发出的流式响应并回传
-        chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['pageBridge.js'], world: 'MAIN' }).catch(() => {});
-
-        setTimeout(() => {
-          const prompt = (env.data.messages || []).map((m) => m.content).join('\n');
-          const payload = {
-            type: 'task.run',
-            task: {
-              task_id: env.task_id,
-              prompt,
-              stream: env.data.stream !== false,
-              inputSelector: tabCfg.inputSelector || '',
-              sendSelector: tabCfg.sendSelector || '',
-              sseField: tabCfg.sseField || '',
+        chrome.storage.local.get('pageBridgeDebug', (pbStore) => {
+          const pbDebug = !!(pbStore && pbStore.pageBridgeDebug);
+          chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            world: 'MAIN',
+            func: (chatApi, sseField, logPaths, pageBridgeDebug) => {
+              try {
+                const raw = window.localStorage.getItem('__relayCfg') || '{}';
+                const o = JSON.parse(raw);
+                if (chatApi) o.chatApi = chatApi;
+                if (sseField) o.sseField = sseField;
+                if (logPaths) o.logPaths = logPaths;
+                o.pageBridgeDebug = !!pageBridgeDebug;
+                window.__relayPageBridgeDebug = o.pageBridgeDebug;
+                window.localStorage.setItem('__relayCfg', JSON.stringify(o));
+              } catch (e) {}
             },
-          };
-          chrome.webNavigation.getAllFrames({ tabId }, (frames) => {
-            const list = (frames && frames.length) ? frames : [{ frameId: 0 }];
-            for (const f of list) {
-              chrome.tabs.sendMessage(tabId, payload, { frameId: f.frameId }).catch(() => {});
-            }
-          });
-        }, 250);
+            args: [ tabCfg.chatApi || '', tabCfg.sseField || '', tabCfg.logPaths || '', pbDebug ],
+          }).catch(() => {});
+          // 注入【主世界】pageBridge.js：hook 页面真实 fetch/XHR/SSE，抓主世界发出的流式响应并回传
+          chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['pageBridge.js'], world: 'MAIN' }).catch(() => {});
+
+          setTimeout(() => {
+            const prompt = (env.data.messages || []).map((m) => m.content).join('\n');
+            const payload = {
+              type: 'task.run',
+              task: {
+                task_id: env.task_id,
+                prompt,
+                stream: env.data.stream !== false,
+                inputSelector: tabCfg.inputSelector || '',
+                sendSelector: tabCfg.sendSelector || '',
+                sseField: tabCfg.sseField || '',
+              },
+            };
+            chrome.webNavigation.getAllFrames({ tabId }, (frames) => {
+              const list = (frames && frames.length) ? frames : [{ frameId: 0 }];
+              for (const f of list) {
+                chrome.tabs.sendMessage(tabId, payload, { frameId: f.frameId }).catch(() => {});
+              }
+            });
+          }, 250);
+        });
       });
       break;
     }

@@ -18,6 +18,15 @@
     <span class="pick-tip" id="pickTip">关闭</span>
   </div>
 
+  <div class="pick-bar">
+    <label class="pick-toggle" title="开启后，目标网页控制台会打印 [pageBridge:...] 抓到的流式内容，便于排查">
+      <input type="checkbox" id="pbLog" />
+      <span class="pick-track"></span>
+      <span class="pick-label">🖥 pageBridge 日志</span>
+    </label>
+    <span class="pick-tip" id="pbLogTip">关闭</span>
+  </div>
+
   <label>目标标签页（默认自动匹配当前活动页，可手动切换）
     <select id="targetTabId"><option value="">— 请先在扩展设置中启用并配置标签页 —</option></select>
   </label>
