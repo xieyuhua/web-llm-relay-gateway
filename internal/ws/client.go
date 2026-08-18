@@ -52,6 +52,12 @@ func NewClient(conn *websocket.Conn, hub *Hub) *Client {
 
 // serve 串行消费本实例的任务队列：保证同一时刻只有 1 个客户端在网页上操作。
 // 取队首任务 → 下发 task.create → 阻塞等待其 DoneCh → 再处理下一个。
+//
+// 必须加「超时兜底」：DoneCh 的关闭完全依赖插件回 task.done/task.error 信令。
+// 若插件漏发/迟发 done（网页已回复但结束信令未回传 WS），serve 会永久卡死在当前任务，
+// 导致本实例的 queue 再无人消费、所有后续 agent（含其他客户端）全部阻塞、
+// 表现为「网页回完了却不释放、谁都提交不了」。故等待时叠加与任务超时对齐的兜底，
+// 超时即把任务标记 timeout 并继续下一个，确保实例不会被单个任务拖死。
 func (c *Client) serve() {
 	for {
 		select {
@@ -65,8 +71,22 @@ func (c *Client) serve() {
 			if err := c.Send(pt.env); err != nil {
 				c.hub.taskMgr.Fail(pt.taskID, "SEND_FAILED", err.Error())
 			}
-			// 等待该任务结束（manager 在 done/fail 时 close(DoneCh)，多等待者均可接收）
-			<-pt.task.DoneCh
+			// 注：占用名额（incrTasks）已在 Enqueue 入队前完成，避免并发竞态导致
+			// max_queue=0 时第 2 个请求未被拒绝却排队等待。此处仅负责在任务结束后 decrTasks。
+			// 等待该任务结束（manager 在 done/fail 时 close(DoneCh)，多等待者均可接收）。
+			// 用 select + 超时兜底：即便插件漏报 done，也不会永久占用本实例。
+			timeout := c.hub.taskMgr.Timeout()
+			timer := time.NewTimer(timeout)
+			select {
+			case <-pt.task.DoneCh:
+				timer.Stop()
+			case <-timer.C:
+				// 插件未在超时内回传 done：主动把任务标记超时并释放本实例，
+				// 使队列后续任务（其他 agent）能继续被调度执行。
+				log.Printf("[ws] instance %s task %s not done within %s, force timeout & release slot", c.InstanceID, pt.taskID, timeout)
+				c.hub.taskMgr.TimeoutTask(pt.taskID)
+			}
+			c.decrTasks() // 执行结束，释放占用，允许后续排队任务被调度
 		}
 	}
 }

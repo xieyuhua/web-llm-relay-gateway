@@ -121,7 +121,7 @@ func (m *Manager) OnDone(id, finishReason string) {
 // Fail 标记任务失败。
 func (m *Manager) Fail(id, code, message string) {
 	if t, ok := m.Get(id); ok {
-		if t.Status == StatusDone || t.Status == StatusFailed {
+		if t.Status == StatusDone || t.Status == StatusFailed || t.Status == StatusTimeout {
 			return
 		}
 		t.Status = StatusFailed
@@ -133,6 +133,31 @@ func (m *Manager) Fail(id, code, message string) {
 		}
 		close(t.DoneCh)
 		log.Printf("[task] %s failed: %s %s", id, code, message)
+	}
+}
+
+// Timeout 返回单任务超时配置（供 serve 兜底等待使用）。
+func (m *Manager) Timeout() time.Duration {
+	return m.taskTimeout
+}
+
+// TimeoutTask 主动把未终态的任务标记超时并安全释放 DoneCh。
+// 供 ws serve 兜底使用：当插件漏报 task.done 时，避免实例被单个任务永久占用。
+// 幂等：已终态（done/failed/cancelled/timeout）直接跳过，绝不重复 close DoneCh。
+func (m *Manager) TimeoutTask(id string) {
+	if t, ok := m.Get(id); ok {
+		if t.Status == StatusDone || t.Status == StatusFailed || t.Status == StatusCancelled || t.Status == StatusTimeout {
+			return
+		}
+		t.Status = StatusTimeout
+		t.ErrCode = "TASK_TIMEOUT"
+		t.ErrMessage = "task exceeded " + m.taskTimeout.String()
+		t.FinishedAt = time.Now().Unix()
+		if t.timeout != nil {
+			t.timeout.Stop()
+		}
+		close(t.DoneCh)
+		log.Printf("[task] %s timeout", id)
 	}
 }
 

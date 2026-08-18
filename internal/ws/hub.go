@@ -168,12 +168,30 @@ func (h *Hub) Enqueue(model, taskID string, task *task.Task, taskData *Envelope)
 	if c == nil {
 		return nil, errors.New("no available instance for model " + model)
 	}
-	// 容量检查：队列中已等待的数量 + 正在执行的 1 个 ≤ maxQueue + 1
-	if len(c.queue) >= h.maxQueue {
+	// 容量检查：实例同时可接纳的任务数 = 1（正在执行）+ maxQueue（排队等待）。
+	// maxQueue=0 即"严格串行"：仅允许 1 个执行中，第 2 个并发立即拒绝；
+	// maxQueue=3 即 1 执行 + 3 等待，第 5 个被拒。
+	// 注意不能用 len(c.queue) >= maxQueue 直接判断：maxQueue=0 时该条件恒成立，
+	// 会连首任务都拒绝（表现为"一个都执行不了"）。正确做法是把"正在执行的 1 个"
+	// 也计入配额，用 getTasks()（执行中）+ len(queue)（等待中）与 1+maxQueue 比较。
+	//
+	// 关键：必须在「入队前」先 incrTasks() 占用名额，否则存在竞态——
+	// serve() 在取出任务后才 incrTasks()，两个并发请求都在 serve 递增前通过检查、
+	// 双双入队，导致 maxQueue=0 时第 2 个没被拒而是排队等待（与严格串行语义相悖）。
+	// 入队成功与否都需正确回退该计数：入队失败（满）则 decrTasks；入队成功由
+	// serve 在任务真正结束后 decrTasks 释放。
+	if c.getTasks()+len(c.queue) >= 1+h.maxQueue {
 		return nil, ErrBusy
 	}
-	c.queue <- &pendingTask{taskID: taskID, task: task, env: taskData}
-	return c, nil
+	c.incrTasks() // 先占用名额，保证并发 Enqueue 能看到当前实例已被占用
+	select {
+	case c.queue <- &pendingTask{taskID: taskID, task: task, env: taskData}:
+		return c, nil
+	default:
+		// 理论不会走到（容量已校验），但做防御性回退，避免计数泄漏
+		c.decrTasks()
+		return nil, ErrBusy
+	}
 }
 
 // Release 任务结束时的清理钩子（当前串行队列下为兼容保留，无实际操作）。

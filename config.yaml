@@ -31,4 +31,4 @@ concurrency:
 
 # 单任务超时时间（秒）。从任务创建到完成（done/failed）的全局上限，
 # 超时后任务被标记为 timeout 并失败。环境变量 TASK_TIMEOUT 可覆盖。
-task_timeout: 120
+task_timeout: 600
