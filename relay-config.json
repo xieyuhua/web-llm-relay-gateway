@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "exportedAt": "2026-08-19T02:02:34.120Z",
+  "targetTabs": {
+    "https://chat.deepseek.com/a/chat": {
+      "autoConnect": true,
+      "chatApi": "/chat/completion",
+      "enabled": true,
+      "favIcon": "https://fe-static.deepseek.com/chat/favicon.svg",
+      "inputSelector": "div._765a5cd > div.ds-virtual-list.ds-virtual-list--printable:nth-of-type(2) > div._871cbca:nth-of-type(4) > div.aaff8b8f:nth-of-type(2) > div._77cefa5._3d616d3 > div._020ab5b > div._24fad49:nth-of-type(1) > textarea._27c9245.ds-scroll-area",
+      "models": "chatgpt-web",
+      "sendSelector": "div._77cefa5._3d616d3 > div._020ab5b > div.ec4f5d61:nth-of-type(2) > div.bf38813a:nth-of-type(2) > div:nth-of-type(2) > div.ds-button.ds-button--primary > div.ds-button__icon.ds-button__icon--last-child:nth-of-type(2) > svg",
+      "sseField": "{\"type\":\"map\",\"fields\":[{\"std\":\"choices.0.delta.content\",\"src\":\"v\"},{\"std\":\"choices.0.delta.role\",\"src\":\"choices.0.delta.role\"},{\"std\":\"id\",\"src\":\"id\"},{\"std\":\"model\",\"src\":\"model\"},{\"std\":\"choices.0.finish_reason\",\"src\":\"choices.0.finish_reason\"}]}",
+      "ssePreset": "",
+      "tag": "deepseek",
+      "title": "DeepSeek - 探索未至之境",
+      "token": "sk-demo-token",
+      "url": "https://chat.deepseek.com/",
+      "wsUrl": "ws://127.0.0.1:8191/ws"
+    },
+    "https://studio.stepfun.com/playground/278453020282425344": {
+      "autoConnect": true,
+      "chatApi": "api/stdhttp/v1/studio/stream",
+      "enabled": true,
+      "favIcon": "https://studio.stepfun.com/favicon.svg",
+      "inputSelector": "div.min-h-0.flex-1 > div.flex.h-full > main.flex.min-w-0 > div.bg-background:nth-of-type(2) > div.mx-auto.w-full > div.mt-2 > div.rounded-xl.border > textarea.flex.field-sizing-content",
+      "models": "chatgpt-web",
+      "sendSelector": "main.flex.min-w-0 > div.bg-background:nth-of-type(2) > div.mx-auto.w-full > div.mt-2 > div.rounded-xl.border > div.mt-2.flex > div.flex.items-center:nth-of-type(2) > button.inline-flex.shrink-0",
+      "sseField": "{\"type\":\"map\",\"fields\":[{\"std\":\"choices.0.delta.content\",\"src\":\"data.delta\"},{\"std\":\"choices.0.delta.role\",\"src\":\"data.role\"},{\"std\":\"id\",\"src\":\"seq\"},{\"std\":\"model\",\"src\":\"model\"},{\"std\":\"choices.0.finish_reason\",\"src\":\"finish_reason\"}]}",
+      "ssePreset": "",
+      "tag": "stepfun",
+      "title": "AI Studio | StepFun",
+      "token": "sk-demo-token",
+      "url": "https://studio.stepfun.com/playground/276731974181240832",
+      "wsUrl": "ws://127.0.0.1:8191/ws"
+    },
+    "https://yuanbao.tencent.com/chat/naQivTmsDa/0PhRATooFJw": {
+      "autoConnect": true,
+      "chatApi": "/api/chat",
+      "enabled": true,
+      "favIcon": "https://static.yuanbao.tencent.com/m/yuanbao-web/favicon_new@32.png",
+      "inputSelector": "#search-bar > div.chat-input-editor.InputTextArea_hightLightTextAreaNew__aKxTD > div.ql-editor > p",
+      "models": "chatgpt-web-111",
+      "sendSelector": "#yuanbao-send-btn > span.hyc-common-icon.iconfont",
+      "sseField": "{\"type\":\"map\",\"fields\":[{\"std\":\"choices.0.delta.content\",\"src\":\"msg\"},{\"std\":\"choices.0.delta.role\",\"src\":\"data.role\"},{\"std\":\"id\",\"src\":\"message_id\"},{\"std\":\"model\",\"src\":\"model\"},{\"std\":\"choices.0.finish_reason\",\"src\":\"finish_reason\"}]}",
+      "ssePreset": "",
+      "tag": "yuanbao",
+      "title": "元宝-腾讯旗下全能AI助手",
+      "token": "sk-demo-token",
+      "url": "https://yuanbao.tencent.com/chat/naQivTmsDa/0PhRATooFJw",
+      "wsUrl": "ws://127.0.0.1:8191/ws"
+    }
+  }
+}
